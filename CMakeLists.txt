@@ -58,6 +58,10 @@ include_directories(${OPENSSL_INCLUDE_DIR})
 
 add_library(${NAME} SHARED ${sources})
 
+target_link_libraries(${NAME} pthread)
+target_link_libraries(${NAME} ibverbs)
+target_link_libraries(${NAME} rdmacm)
+
 install(DIRECTORY emp-tool DESTINATION include/)
 install(DIRECTORY cmake/ DESTINATION cmake/)
 install(TARGETS ${NAME} DESTINATION lib)
