@@ -9,7 +9,7 @@
 #include "emp-tool/io/io_channel.h"
 using std::string;
 
-
+#include <sys/time.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/types.h>
@@ -28,7 +28,7 @@ using std::string;
 #define MSG "SEND operation "
 #define RDMAMSGR "RDMA read operation "
 #define RDMAMSGW "RDMA write operation"
-#define MSG_SIZE 2048
+#define MSG_SIZE 1 << 16
 // #if __BYTE_ORDER == __LITTLE_ENDIAN
 // static inline uint64_t htonll(uint64_t x) { return bswap_64(x); }
 // static inline uint64_t ntohll(uint64_t x) { return bswap_64(x); }
@@ -84,6 +84,8 @@ struct config_t config = {
 	1,	 /* ib_port */
 	3 /* gid_idx */};
 
+int wr_id = 0;
+
 class NetIO: public IOChannel<NetIO> { public:
 	bool is_server;
 	int mysocket = -1;
@@ -94,152 +96,172 @@ class NetIO: public IOChannel<NetIO> { public:
 	string addr;
 	int port;
 	struct resources res;
-	NetIO(const char * address, int port, bool quiet = false) {
+	bool rdma_enabled = false;
+	NetIO(const char * address, int port, bool quiet = false, bool rdma_enabled = false) {
 		if (port < 0 || port > 65535) {
 			throw std::runtime_error("Invalid port number!");
 		}
-
-		this->port = port;
-		is_server = (address == nullptr);
-		if (address == nullptr) {
-			struct sockaddr_in dest;
-			struct sockaddr_in serv;
-			socklen_t socksize = sizeof(struct sockaddr_in);
-			memset(&serv, 0, sizeof(serv));
-			serv.sin_family = AF_INET;
-			serv.sin_addr.s_addr = htonl(INADDR_ANY); /* set our address to any interface */
-			serv.sin_port = htons(port);           /* set the server port number */
-			mysocket = socket(AF_INET, SOCK_STREAM, 0);
-			int reuse = 1;
-			setsockopt(mysocket, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
-			if(bind(mysocket, (struct sockaddr *)&serv, sizeof(struct sockaddr)) < 0) {
-				perror("error: bind");
-				exit(1);
-			}
-			if(listen(mysocket, 1) < 0) {
-				perror("error: listen");
-				exit(1);
-			}
-			consocket = accept(mysocket, (struct sockaddr *)&dest, &socksize);
-			close(mysocket);
-		}
-		else {
-			addr = string(address);
-
-			struct sockaddr_in dest;
-			memset(&dest, 0, sizeof(dest));
-			dest.sin_family = AF_INET;
-			dest.sin_addr.s_addr = inet_addr(address);
-			dest.sin_port = htons(port);
-
-			while(1) {
-				consocket = socket(AF_INET, SOCK_STREAM, 0);
-
-				if (connect(consocket, (struct sockaddr *)&dest, sizeof(struct sockaddr)) == 0) {
-					break;
+		if (!rdma_enabled) {
+			this->port = port;
+			is_server = (address == nullptr);
+			if (address == nullptr) {
+				struct sockaddr_in dest;
+				struct sockaddr_in serv;
+				socklen_t socksize = sizeof(struct sockaddr_in);
+				memset(&serv, 0, sizeof(serv));
+				serv.sin_family = AF_INET;
+				serv.sin_addr.s_addr = htonl(INADDR_ANY); /* set our address to any interface */
+				serv.sin_port = htons(port);           /* set the server port number */
+				mysocket = socket(AF_INET, SOCK_STREAM, 0);
+				int reuse = 1;
+				setsockopt(mysocket, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+				if(bind(mysocket, (struct sockaddr *)&serv, sizeof(struct sockaddr)) < 0) {
+					perror("error: bind");
+					exit(1);
 				}
-
-				close(consocket);
-				usleep(1000);
+				if(listen(mysocket, 1) < 0) {
+					perror("error: listen");
+					exit(1);
+				}
+				consocket = accept(mysocket, (struct sockaddr *)&dest, &socksize);
+				close(mysocket);
 			}
-		}
-		set_nodelay();
-		stream = fdopen(consocket, "wb+");
-		buffer = new char[NETWORK_BUFFER_SIZE];
-		memset(buffer, 0, NETWORK_BUFFER_SIZE);
-		setvbuf(stream, buffer, _IOFBF, NETWORK_BUFFER_SIZE);
-		if(!quiet)
-			std::cout << "connected\n";
+			else {
+				addr = string(address);
 
+				struct sockaddr_in dest;
+				memset(&dest, 0, sizeof(dest));
+				dest.sin_family = AF_INET;
+				dest.sin_addr.s_addr = inet_addr(address);
+				dest.sin_port = htons(port);
 
+				while(1) {
+					consocket = socket(AF_INET, SOCK_STREAM, 0);
 
-		// Initialize resources
-		std::cout << "Initializing RDMA Resources \n";
-		memset(&res, 0, sizeof res);
-		res.sock = consocket;
+					if (connect(consocket, (struct sockaddr *)&dest, sizeof(struct sockaddr)) == 0) {
+						break;
+					}
 
-		if (resources_create(&res))
-		{
-			fprintf(stderr, "failed to create resources\n");
+					close(consocket);
+					usleep(1000);
+				}
+			}
+			set_nodelay();
+			stream = fdopen(consocket, "wb+");
+			buffer = new char[NETWORK_BUFFER_SIZE];
+			memset(buffer, 0, NETWORK_BUFFER_SIZE);
+			setvbuf(stream, buffer, _IOFBF, NETWORK_BUFFER_SIZE);
+			if(!quiet)
+				std::cout << "connected\n";
 		}
 		else {
-			fprintf(stdout, "Resources connected\n");
+			this->rdma_enabled = true;
+			// Initialize resources
+			std::cout << "Initializing RDMA Resources \n";
+			memset(&res, 0, sizeof res);
+			res.sock = -1;
+
+			char temp_char;
+
+			if (resources_create(&res))
+			{
+				fprintf(stderr, "failed to create resources\n");
+			}
+			else {
+				fprintf(stdout, "Resources connected\n");
+			}
+			
+			// Connect QP
+			if (connect_qp(&res)) {
+				fprintf(stderr, "failed to connect QPs\n");
+			}
+			else {
+				fprintf(stdout, "QP connected\n");
+			}
+
+			// Test connection
+			if (!config.server_name) {
+				if (post_send(&res, IBV_WR_SEND)) {
+					fprintf(stderr, "failed to post sr\n");
+				}
+			}
+			if (poll_completion(&res)) {
+				fprintf(stderr, "poll completion failed\n");
+			}
+			
+
+			memset(res.buf, 0, MSG_SIZE);
+
+			post_receive(&res);
 		}
 		
-		// Connect QP
-		if (connect_qp(&res)) {
-			fprintf(stderr, "failed to connect QPs\n");
-		}
-		else {
-			fprintf(stdout, "QP connected\n");
-		}
 	}
 
-	// static int sock_connect(const char *servername, int port) {
-	// 	struct addrinfo *resolved_addr = NULL;
-	// 	struct addrinfo *iterator;
-	// 	char service[6];
-	// 	int sockfd = -1;
-	// 	int listenfd = 0;
-	// 	int tmp;
-	// 	struct addrinfo hints =
-	// 		{
-	// 			.ai_flags = AI_PASSIVE,
-	// 			.ai_family = AF_INET,
-	// 			.ai_socktype = SOCK_STREAM};
-	// 	if (sprintf(service, "%d", port) < 0)
-	// 		goto sock_connect_exit;
-	// 	/* Resolve DNS address, use sockfd as temp storage */
-	// 	sockfd = getaddrinfo(servername, service, &hints, &resolved_addr);
-	// 	if (sockfd < 0)
-	// 	{
-	// 		fprintf(stderr, "%s for %s:%d\n", gai_strerror(sockfd), servername, port);
-	// 		goto sock_connect_exit;
-	// 	}
-	// 	/* Search through results and find the one we want */
-	// 	for (iterator = resolved_addr; iterator; iterator = iterator->ai_next)
-	// 	{
-	// 		sockfd = socket(iterator->ai_family, iterator->ai_socktype, iterator->ai_protocol);
-	// 		if (sockfd >= 0)
-	// 		{
-	// 			if (servername){
-	// 				/* Client mode. Initiate connection to remote */
-	// 				if ((tmp = connect(sockfd, iterator->ai_addr, iterator->ai_addrlen)))
-	// 				{
-	// 					fprintf(stdout, "failed connect \n");
-	// 					close(sockfd);
-	// 					sockfd = -1;
-	// 				}
-	// 			}
-	// 			else
-	// 			{
-	// 					/* Server mode. Set up listening socket an accept a connection */
-	// 					listenfd = sockfd;
-	// 					sockfd = -1;
-	// 					if (bind(listenfd, iterator->ai_addr, iterator->ai_addrlen))
-	// 						goto sock_connect_exit;
-	// 					listen(listenfd, 1);
-	// 					sockfd = accept(listenfd, NULL, 0);
-	// 			}
-	// 		}
-	// 	}
-	// sock_connect_exit:
-	// 	if (listenfd)
-	// 		close(listenfd);
-	// 	if (resolved_addr)
-	// 		freeaddrinfo(resolved_addr);
-	// 	if (sockfd < 0)
-	// 	{
-	// 		if (servername)
-	// 			fprintf(stderr, "Couldn't connect to %s:%d\n", servername, port);
-	// 		else
-	// 		{
-	// 			perror("server accept");
-	// 			fprintf(stderr, "accept() failed\n");
-	// 		}
-	// 	}
-	// 	return sockfd;
-	// }
+	static int sock_connect(const char *servername, int port) {
+		struct addrinfo *resolved_addr = NULL;
+		struct addrinfo *iterator;
+		char service[6];
+		int sockfd = -1;
+		int listenfd = 0;
+		int tmp;
+		struct addrinfo hints =
+			{
+				.ai_flags = AI_PASSIVE,
+				.ai_family = AF_INET,
+				.ai_socktype = SOCK_STREAM};
+		if (sprintf(service, "%d", port) < 0)
+			goto sock_connect_exit;
+		/* Resolve DNS address, use sockfd as temp storage */
+		sockfd = getaddrinfo(servername, service, &hints, &resolved_addr);
+		if (sockfd < 0)
+		{
+			fprintf(stderr, "%s for %s:%d\n", gai_strerror(sockfd), servername, port);
+			goto sock_connect_exit;
+		}
+		/* Search through results and find the one we want */
+		for (iterator = resolved_addr; iterator; iterator = iterator->ai_next)
+		{
+			sockfd = socket(iterator->ai_family, iterator->ai_socktype, iterator->ai_protocol);
+			if (sockfd >= 0)
+			{
+				if (servername){
+					/* Client mode. Initiate connection to remote */
+					if ((tmp = connect(sockfd, iterator->ai_addr, iterator->ai_addrlen)))
+					{
+						fprintf(stdout, "failed connect \n");
+						close(sockfd);
+						sockfd = -1;
+					}
+				}
+				else
+				{
+						/* Server mode. Set up listening socket an accept a connection */
+						listenfd = sockfd;
+						sockfd = -1;
+						if (bind(listenfd, iterator->ai_addr, iterator->ai_addrlen))
+							goto sock_connect_exit;
+						listen(listenfd, 1);
+						sockfd = accept(listenfd, NULL, 0);
+				}
+			}
+		}
+	sock_connect_exit:
+		if (listenfd)
+			close(listenfd);
+		if (resolved_addr)
+			freeaddrinfo(resolved_addr);
+		if (sockfd < 0)
+		{
+			if (servername)
+				fprintf(stderr, "Couldn't connect to %s:%d\n", servername, port);
+			else
+			{
+				perror("server accept");
+				fprintf(stderr, "accept() failed\n");
+			}
+		}
+		return sockfd;
+	}
 
 	static int resources_create(struct resources *res) {
 		struct ibv_device **dev_list = NULL;
@@ -252,29 +274,29 @@ class NetIO: public IOChannel<NetIO> { public:
 		int num_devices;
 		int rc = 0;
 		/* if client side */
-		// if (config.server_name)
-		// {
-		// 	res->sock = sock_connect(config.server_name, config.tcp_port);
-		// 	if (res->sock < 0)
-		// 	{
-		// 		fprintf(stderr, "failed to establish TCP connection to server %s, port %d\n",
-		// 				config.server_name, config.tcp_port);
-		// 		rc = -1;
-		// 		goto resources_create_exit;
-		// 	}
-		// }
-		// else
-		// {
-		// 	fprintf(stdout, "waiting on port %d for TCP connection\n", config.tcp_port);
-		// 	res->sock = sock_connect(NULL, config.tcp_port);
-		// 	if (res->sock < 0)
-		// 	{
-		// 		fprintf(stderr, "failed to establish TCP connection with client on port %d\n",
-		// 				config.tcp_port);
-		// 		rc = -1;
-		// 		goto resources_create_exit;
-		// 	}
-		// }
+		if (config.server_name)
+		{
+			res->sock = sock_connect(config.server_name, config.tcp_port);
+			if (res->sock < 0)
+			{
+				fprintf(stderr, "failed to establish TCP connection to server %s, port %d\n",
+						config.server_name, config.tcp_port);
+				rc = -1;
+				goto resources_create_exit;
+			}
+		}
+		else
+		{
+			fprintf(stdout, "waiting on port %d for TCP connection\n", config.tcp_port);
+			res->sock = sock_connect(NULL, config.tcp_port);
+			if (res->sock < 0)
+			{
+				fprintf(stderr, "failed to establish TCP connection with client on port %d\n",
+						config.tcp_port);
+				rc = -1;
+				goto resources_create_exit;
+			}
+		}
 		fprintf(stdout, "TCP connection was established\n");
 		fprintf(stdout, "searching for IB devices in host\n");
 		/* get device names in the system */
@@ -385,8 +407,8 @@ class NetIO: public IOChannel<NetIO> { public:
 		qp_init_attr.sq_sig_all = 1;
 		qp_init_attr.send_cq = res->cq;
 		qp_init_attr.recv_cq = res->cq;
-		qp_init_attr.cap.max_send_wr = 128;
-		qp_init_attr.cap.max_recv_wr = 128;
+		qp_init_attr.cap.max_send_wr = 1;
+		qp_init_attr.cap.max_recv_wr = 1;
 		qp_init_attr.cap.max_send_sge = 1;
 		qp_init_attr.cap.max_recv_sge = 1;
 		res->qp = ibv_create_qp(res->pd, &qp_init_attr);
@@ -600,7 +622,7 @@ class NetIO: public IOChannel<NetIO> { public:
 		attr.qp_state = IBV_QPS_RTS;
 		attr.timeout = 0x12;
 		attr.retry_cnt = 6;
-		attr.rnr_retry = 0;
+		attr.rnr_retry = 7;
 		attr.sq_psn = 0;
 		attr.max_rd_atomic = 1;
 		flags = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
@@ -644,7 +666,7 @@ class NetIO: public IOChannel<NetIO> { public:
 		/* prepare the send work request */
 		memset(&sr, 0, sizeof(sr));
 		sr.next = NULL;
-		sr.wr_id = 0;
+		sr.wr_id = wr_id;
 		sr.sg_list = &sge;
 		sr.num_sge = 1;
 		sr.opcode = opcode;
@@ -663,7 +685,7 @@ class NetIO: public IOChannel<NetIO> { public:
 			switch (opcode)
 			{
 			case IBV_WR_SEND:
-				fprintf(stdout, "Send Request was posted\n");
+				// fprintf(stdout, "Send Request was posted\n");
 				break;
 			case IBV_WR_RDMA_READ:
 				fprintf(stdout, "RDMA Read Request was posted\n");
@@ -692,15 +714,101 @@ class NetIO: public IOChannel<NetIO> { public:
 		/* prepare the receive work request */
 		memset(&rr, 0, sizeof(rr));
 		rr.next = NULL;
-		rr.wr_id = 0;
+		rr.wr_id = wr_id;
 		rr.sg_list = &sge;
 		rr.num_sge = 1;
 		/* post the Receive Request to the RQ */
 		rc = ibv_post_recv(res->qp, &rr, &bad_wr);
 		if (rc)
 			fprintf(stderr, "failed to post RR\n");
+		else {
+			// fprintf(stdout, "Receive Request was posted\n");
+		}
+		return rc;
+	}
+
+	static int poll_completion(struct resources *res) {
+		struct ibv_wc wc;
+		unsigned long start_time_msec;
+		unsigned long cur_time_msec;
+		struct timeval cur_time;
+		int poll_result;
+		int rc = 0;
+		/* poll the completion for a while before giving up of doing it .. */
+		gettimeofday(&cur_time, NULL);
+		start_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
+		do
+		{
+			poll_result = ibv_poll_cq(res->cq, 1, &wc);
+			gettimeofday(&cur_time, NULL);
+			cur_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
+		} while ((poll_result == 0) && ((cur_time_msec - start_time_msec) < MAX_POLL_CQ_TIMEOUT));
+		if (poll_result < 0)
+		{
+			/* poll CQ failed */
+			fprintf(stderr, "poll CQ failed\n");
+			rc = 1;
+		}
+		else if (poll_result == 0)
+		{ /* the CQ is empty */
+			fprintf(stderr, "completion wasn't found in the CQ after timeout\n");
+			rc = 1;
+		}
 		else
-			fprintf(stdout, "Receive Request was posted\n");
+		{
+			/* CQE found */
+			// fprintf(stdout, "completion was found in CQ with status 0x%x\n", wc.status);
+			/* check the completion status (here we don't care about the completion opcode */
+			if (wc.status != IBV_WC_SUCCESS)
+			{
+				fprintf(stderr, "got bad completion with status: 0x%x, vendor syndrome: 0x%x\n", wc.status,
+						wc.vendor_err);
+				rc = 1;
+			}
+		}
+		return rc;
+	}
+
+	static int resources_destroy(struct resources *res) {
+		int rc = 0;
+		if (res->qp)
+			if (ibv_destroy_qp(res->qp))
+			{
+				fprintf(stderr, "failed to destroy QP\n");
+				rc = 1;
+			}
+		if (res->mr)
+			if (ibv_dereg_mr(res->mr))
+			{
+				fprintf(stderr, "failed to deregister MR\n");
+				rc = 1;
+			}
+		if (res->buf)
+			free(res->buf);
+		if (res->cq)
+			if (ibv_destroy_cq(res->cq))
+			{
+				fprintf(stderr, "failed to destroy CQ\n");
+				rc = 1;
+			}
+		if (res->pd)
+			if (ibv_dealloc_pd(res->pd))
+			{
+				fprintf(stderr, "failed to deallocate PD\n");
+				rc = 1;
+			}
+		if (res->ib_ctx)
+			if (ibv_close_device(res->ib_ctx))
+			{
+				fprintf(stderr, "failed to close device context\n");
+				rc = 1;
+			}
+		if (res->sock >= 0)
+			if (close(res->sock))
+			{
+				fprintf(stderr, "failed to close socket\n");
+				rc = 1;
+			}
 		return rc;
 	}
 
@@ -737,28 +845,57 @@ class NetIO: public IOChannel<NetIO> { public:
 	}
 
 	void send_data_internal(const void * data, size_t len) {
-		size_t sent = 0;
-		while(sent < len) {
-			size_t res = fwrite(sent + (char*)data, 1, len - sent, stream);
-			if (res > 0)
-				sent+=res;
-			else
-				error("net_send_data\n");
+		if (!this->rdma_enabled) {
+			size_t sent = 0;
+			while(sent < len) {
+				size_t res = fwrite(sent + (char*)data, 1, len - sent, stream);
+				if (res > 0)
+					sent+=res;
+				else
+					error("net_send_data\n");
+			}
+			has_sent = true;
+		} else {
+
+			memcpy(res.buf, (char*)data, len);
+
+			if (post_send(&res, IBV_WR_SEND)) {
+				printf("Post send failed in send internal\n");
+			}
+			if (poll_completion(&res)) {
+				printf("Poll completion failed in send internal\n");
+			} else {
+				wr_id++;
+			}
 		}
-		has_sent = true;
 	}
 
 	void recv_data_internal(void  * data, size_t len) {
-		if(has_sent)
-			fflush(stream);
-		has_sent = false;
-		size_t sent = 0;
-		while(sent < len) {
-			size_t res = fread(sent + (char*)data, 1, len - sent, stream);
-			if (res > 0)
-				sent += res;
-			else
-				error("net_recv_data\n");
+		if (!this->rdma_enabled) {
+			if(has_sent) {
+				fflush(stream);
+			}
+			has_sent = false;
+			size_t sent = 0;
+			while(sent < len) {
+				size_t res = fread(sent + (char*)data, 1, len - sent, stream);
+				if (res > 0)
+					sent += res;
+				else
+					error("net_recv_data\n");
+			}
+		} else {
+			if (poll_completion(&res)) {
+				printf("Poll completion failed in recv internal\n");
+			} else {
+				wr_id++;
+			}
+
+			memcpy(data, (void*) res.buf, len);
+
+			if (post_receive(&res)) {
+				printf("Post receive failed in recv internal\n");
+			}
 		}
 	}
 };
