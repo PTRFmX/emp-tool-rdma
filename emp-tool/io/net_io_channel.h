@@ -164,7 +164,7 @@ class NetIO: public IOChannel<NetIO> { public:
 	}
 
 	void flush() {
-		fflush(stream);
+		// fflush(stream);
 	}
 
 	// void printData(void* data, size_t len) {
@@ -177,23 +177,25 @@ class NetIO: public IOChannel<NetIO> { public:
 	void send_data_internal(const void * data, size_t len) {
 		size_t sent = 0;
 		while(sent < len) {
-			size_t res = this->rs ? rwrite(consocket, sent + (char*)data,  len - sent) : fwrite(sent + (char*)data, 1, len - sent, stream);
+			// size_t res = this->rs ? rwrite(consocket, sent + (char*)data,  len - sent) : fwrite(sent + (char*)data, 1, len - sent, stream);
+			size_t res = this->rs ? rwrite(consocket, sent + (char*)data, len - sent) : send(consocket, sent + (char*)data, len - sent, 0);
 			if (res > 0)
 				sent += res;
 			else
 				error("net_send_data\n");
 		}
-		has_sent = true;
+		// has_sent = true;
 	}
 
 	void recv_data_internal(void  * data, size_t len) {
-		if(has_sent) {
-			fflush(stream);
-		}
-		has_sent = false;
+		// if(has_sent) {
+		// 	fflush(stream);
+		// }
+		// has_sent = false;
 		size_t sent = 0;
 		while(sent < len) {
-			size_t res = this->rs ? rread(consocket, sent + (char*)data,  len - sent) : fread(sent + (char*)data, 1, len - sent, stream);
+			// size_t res = this->rs ? rread(consocket, sent + (char*)data,  len - sent) : fread(sent + (char*)data, 1, len - sent, stream);
+			size_t res = this->rs ? rread(consocket, sent + (char*)data, len - sent) : recv(consocket, sent + (char*)data, len - sent, 0);
 			if (res > 0)
 				sent += res;
 			else
