@@ -1,7 +1,7 @@
 #Testing macro
 macro (add_test_executable_with_lib _name libs)
 	add_executable(test_${_name} "${_name}.cpp")
-	target_link_libraries(test_${_name} ${OPENSSL_LIBRARIES} ${libs})
+	target_link_libraries(test_${_name} ${OPENSSL_LIBRARIES} ${libs} ibverbs rdmacm pthread)
 endmacro()
 
 macro (add_test_case _name)
@@ -33,6 +33,7 @@ add_test_case(f2k)
 add_test_case(halfgate)
 add_test_case(to_bool)
 add_test_case(aes_opt)
+add_test_case(test_rdmaio)
 
 IF(${CRYPTO_IN_CIRCUIT})
 add_test_case(sha3_256)
