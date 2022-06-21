@@ -49,63 +49,13 @@ void die(const char *reason)
 }
 
 const int TIMEOUT_IN_MS = 500; /* ms */
-const size_t RDMA_BUFFER_SIZE = 1 << 11;
+const size_t RDMA_BUFFER_SIZE = 1 << 30;
 
-#define MAX_MESSAGE_NUM 10
+#define MAX_MESSAGE_NUM 100
 uint poll_index = 0;
 
 namespace emp
 {
-
-  // class CEvent
-  // {
-  // public:
-  //   CEvent(bool bManualReset = false, bool bInitialSet = false) : m_bManual(bManualReset), m_bSet(bInitialSet)
-  //   {
-  //   }
-  //   ~CEvent() = default;
-
-  //   bool Set()
-  //   {
-  //     std::unique_lock<std::mutex> lock(mutex_);
-  //     if (m_bSet)
-  //       return true;
-
-  //     m_bSet = true;
-  //     lock.unlock();
-  //     cv_.notify_one();
-  //     return true;
-  //   }
-
-  //   bool Wait()
-  //   {
-  //     std::unique_lock<std::mutex> lock(mutex_);
-  //     cv_.wait(lock, [this]
-  //              { return m_bSet; });
-
-  //     if (!m_bManual)
-  //       m_bSet = false;
-  //     return true;
-  //   }
-  //   bool IsSet() const
-  //   {
-  //     std::lock_guard<std::mutex> lock(mutex_);
-  //     return m_bSet;
-  //   }
-  //   bool Reset()
-  //   {
-  //     std::lock_guard<std::mutex> lock(mutex_);
-  //     m_bSet = false;
-  //     return true;
-  //   }
-
-  // private:
-  //   std::condition_variable cv_;
-  //   mutable std::mutex mutex_;
-  //   bool m_bManual;
-  //   bool m_bSet;
-  // };
-
 
   enum msg_type
   {
@@ -129,14 +79,23 @@ namespace emp
   {
     SS_INIT,
     SS_MR_SENT,
-    SS_RDMA_SENT,
+    SS_WAIT_MSG_DATA,
+    SS_SYNC_DONE,
     SS_DONE_SENT
+  };
+
+  enum sync_state {
+    SYNC_WAIT_MSG_DATA,
+    SYNC_WAIT_SEND_DONE,
+    SYNC_DONE
   };
 
   enum r_state
   {
     RS_INIT,
     RS_MR_RECV,
+    RS_WAIT_MSG_DATA,
+    RS_SYNC_DONE,
     RS_DONE_RECV
   };
 
@@ -234,6 +193,10 @@ namespace emp
     std::mutex recv_queue_mutex;
     std::condition_variable recv_queue_cv;
 
+    bool flush_start = false;
+    std::mutex flush_start_mutex;
+    std::condition_variable flush_start_cv;
+
     uint cur_offset = 0;
     uint cur_message_index = 0;
 
@@ -280,9 +243,9 @@ namespace emp
             break;
         }
       }
+      init_sndrecv();
       if (!quiet)
         std::cout << "connection establishment finished\n";
-      init_sndrecv();
     }
 
     ~RDMAIO()
@@ -312,15 +275,9 @@ namespace emp
       else
       {
         // printf("send msg done\n");
-        // send_msg_mutex.lock();
-        // _conn_context->send_msg[0].type = MSG_DONE;
-        printf("send MSG_DONE\n");
-        send_message(_conn_context, MSG_DONE);
-        // send_msg_mutex.unlock();
-        // s_ctx->cq_poller_thread->join();
-        // printf("client disconnect\n");
-        // rdma_disconnect(_conn_context->id);
-        // polling for disconnect
+        // printf("send MSG_DONE\n");
+        // send_message(_conn_context, MSG_DONE);
+        rdma_disconnect(_conn_context->id);
         while (rdma_get_cm_event(ec, &event) == 0)
         {
           struct rdma_cm_event event_copy;
@@ -380,7 +337,7 @@ namespace emp
       _conn_context = (struct conn_context *)id->context;
       _conn_context->connected = 1;
       // printf("send mr\n");
-      send_mr(id->context);
+      // send_mr(id->context);
       // printf("set connected\n");
       return 1; // break loop
     }
@@ -389,9 +346,8 @@ namespace emp
     {
       _conn_context = (struct conn_context *)id->context;
       _conn_context->connected = 1;
-      // printf("send mr\n");
+      printf("send mr\n");
       send_mr(id->context);
-      // printf("posted send mr\n");
       return 1;
     }
 
@@ -400,14 +356,23 @@ namespace emp
       // printf("send data\n");
       if (cur_offset + len > RDMA_BUFFER_SIZE)
       {
-        sync();
+        die("send_data: buffer overflow.");
       }
-      std::unique_lock<std::mutex> lck(send_ready_mutex);
-      send_ready_cv.wait(lck, [this] { return send_ready; });
+      // printf("send data %d\n", len);
+      // std::unique_lock<std::mutex> lck(send_ready_mutex);
+      // send_ready_cv.wait(lck, [this] { return send_ready; });
       post_send_data(data, len, _conn_context->id, cur_offset);
       // printf("cur_offset: %d\n", cur_offset);
       cur_offset += len;
-      lck.unlock();
+      if (len == 4) {
+        printf("pushed a pointer length of %d\n", *(int *)data);
+        printf("at offset: %d\n", cur_offset - len);
+      } else {
+        printf("pushed data length: %d\n", len);
+        printf("at offset: %d\n", cur_offset - len);
+      }
+      // lck.unlock();
+      // printf("posted send data\n");
     }
 
     void post_send_data(const void *data, int len, struct rdma_cm_id *id, uint32_t offset)
@@ -433,41 +398,64 @@ namespace emp
       sge.lkey = conn->rdma_local_mr->lkey;
       // printf("post send rdma write\n");
       TEST_NZ(ibv_post_send(conn->qp, &wr, &bad_wr));
+      // printf("set send_msg: %d, %d, at offset: %d\n", cur_message_index, len, offset);
       conn->send_msg[1].size[cur_message_index] = len; // MSG_DATA = 1
       cur_message_index += 1;
       conn->send_msg[1].size[cur_message_index] = 0; // set the next size as 0 to indicate the end of the message.
       
     }
 
+    std::queue<std::thread> recv_threads_queue;
+    std::queue<recv_task> pending_recv_task_queue;
+    std::mutex pending_recv_task_mutex;
     void recv_data_internal(void *data, size_t len)
     {
-      // printf("recv data\n");
-      // blocking
-      recv_task task;
-      // while (1)
-      // {
-      //   recv_queue_mutex.lock();
-      //   if (recv_queue.empty())
-      //   {
-      //     recv_queue_mutex.unlock();
-      //     continue;
-      //   }
+      // auto recv_func = [this, data, len] () {
+      //   recv_task task;
+      //   std::unique_lock<std::mutex> lck(recv_queue_mutex);
+      //   recv_queue_cv.wait(lck, [this] { return !recv_queue.empty(); });
+      //   // printf("recv queue size: %d\n", recv_queue.size());
       //   task = recv_queue.front();
       //   recv_queue.pop();
-      //   recv_queue_mutex.unlock();
-      //   break;
-      // }
-      std::unique_lock<std::mutex> lck(recv_queue_mutex);
-      recv_queue_cv.wait(lck, [this] { return !recv_queue.empty(); });
-      // printf("recv queue size: %d\n", recv_queue.size());
-      task = recv_queue.front();
-      recv_queue.pop();
-      // printf("recv queue size: %d\n", recv_queue.size());
-      memcpy(data, task.data, task.len);
-      // printf("task len: %d\n", task.len);
-      free(task.data);
-      lck.unlock();
-      // printf("finished receives, task size: %ld\n", len);
+      //   memcpy(data, task.data, task.len);
+      //   free(task.data);
+      //   lck.unlock();
+      // };
+
+      // recv_threads_queue.push(std::thread(recv_func));
+
+      // pending_recv_task_mutex.lock();
+      printf(">>> pushed task len: %d\n", len);
+      pending_recv_task_queue.push(recv_task{data, len});
+      // pending_recv_task_mutex.unlock();
+
+    }
+
+    void recv_data_sync() {
+      recv_task pending_task;
+      while (!pending_recv_task_queue.empty()) {
+        pending_task = pending_recv_task_queue.front();
+        pending_recv_task_queue.pop();
+        // printf("check recv_queue\n");
+        std::unique_lock<std::mutex> lck(recv_queue_mutex);
+        recv_queue_cv.wait(lck, [this] { return !recv_queue.empty(); });
+        recv_task finished_task = recv_queue.front();
+        recv_queue.pop();
+        if (finished_task.len != pending_task.len) {
+          printf("recv_data_sync: length mismatch, recv size: %d, pending size: %d", finished_task.len, pending_task.len);
+          die("recv_data_sync: length mismatch");
+        }
+        memcpy(pending_task.data, finished_task.data, finished_task.len);
+        if (pending_task.len == 4) {
+          printf(">>> recv_data_sync: received a pointer, indicate length: %d\n", *(int *)pending_task.data);
+          // printf(">>> at offset: %d\n", )
+        } else {
+          printf(">>> recv_data_sync: received raw data, length: %d\n", pending_task.len);
+        }
+        free(finished_task.data);
+        // lck.unlock();
+        // printf("recv finished\n");
+      }
     }
 
     int on_addr_resolved(struct rdma_cm_id *id)
@@ -532,13 +520,14 @@ namespace emp
     void send_mr(void *context)
     {
       struct conn_context *conn = (struct conn_context *)context;
-      // send_msg_mutex.lock();
-      // conn->send_msg[0].type = MSG_MR;
+
       for (uint i = 0; i < 4; i++)
         memcpy(&conn->send_msg[i].data.mr, conn->rdma_remote_mr, sizeof(struct ibv_mr));
-      // printf("prepare to send mr message\n");
       send_message(conn, MSG_MR);
-      // send_msg_mutex.unlock();
+    }
+
+    uint32_t num_sync() {
+      return finished_sync_num;
     }
 
     int on_disconnect_client(struct rdma_cm_id *id)
@@ -559,10 +548,13 @@ namespace emp
 
     void init_sndrecv()
     {
-      s_ctx->cq_poller_thread->join();
-      delete s_ctx->cq_poller_thread;
-      s_ctx->cq_poller_thread = new std::thread([this]
-                                                { poll_cq_sndrecv(nullptr); });
+      printf("init_sndrecv.\n");
+      // s_ctx->cq_poller_thread->join();
+      poll_cq_connect(nullptr);
+      printf("cq_poller_thread joined.\n");
+      // delete s_ctx->cq_poller_thread;
+      // s_ctx->cq_poller_thread = new std::thread([this]
+                                                // { poll_cq_sndrecv(nullptr); });
     }
 
     void destroy_connection(void *context)
@@ -598,7 +590,7 @@ namespace emp
       sge.addr = (uintptr_t)(conn->recv_msg);
       sge.length = sizeof(struct message);
       sge.lkey = conn->recv_mr->lkey;
-      // printf("post receive\n");
+      printf("post receive\n");
       TEST_NZ(ibv_post_recv(conn->qp, &wr, &bad_wr));
       // printf("post receive finished\n");
     }
@@ -615,19 +607,22 @@ namespace emp
 
       if (wc->opcode & IBV_WC_RECV)
       {
-        // printf("recved message, type: %d\n", conn->recv_msg->type);
+        printf("recved message, type: %d\n", conn->recv_msg->type);
 
         if (conn->recv_msg->type == MSG_MR)
         {
+          printf("received MR.\n");
           if (conn->recv_state == RS_INIT)
             conn->recv_state = RS_MR_RECV;
           memcpy(&conn->peer_mr, &conn->recv_msg->data.mr, sizeof(conn->peer_mr));
+
+          // if (is_server)
           post_receive_message(conn);
-          // if (conn->send_state == SS_INIT)
-          // {
-          //   printf("send mr\n");
-          //   send_mr(conn);
-          // }
+          if (conn->send_state == SS_INIT)
+          {
+            printf("send mr\n");
+            send_mr(conn);
+          }
         }
         else if (conn->recv_msg->type == MSG_DONE)
         {
@@ -638,11 +633,6 @@ namespace emp
         else if (conn->recv_msg->type == MSG_DATA)
         {
           // printf("recv MSG_DATA\n");
-          // uint size = conn->recv_msg->size;
-          // void *data = malloc(size);
-          // uint offset = conn->recv_msg->offset;
-          // memcpy(data, (char *)conn->rdma_remote_buffer + offset, size);
-          // auto task = recv_task(data, size);
           uint cur_recv_offset = 0;
           std::unique_lock<std::mutex> lk(recv_queue_mutex);
           for (uint i = 0; i < MAX_MESSAGE_NUM; i++) {
@@ -652,6 +642,7 @@ namespace emp
               break;
             }
             void *data = malloc(size);
+            // printf("cur_recv_offset: %d\n", cur_recv_offset);
             memcpy(data, (char *)conn->rdma_remote_buffer + cur_recv_offset, size);
             recv_task task(data, size);
             // printf("push task \n");
@@ -660,29 +651,37 @@ namespace emp
           }
           lk.unlock();
           recv_queue_cv.notify_one();
-          post_receive_message(conn);
-          // send_msg_mutex.lock();
-          // conn->send_msg[1].type = MSG_SYNC;
-          // printf("send MSG_SYNC\n");
-          if (is_server)
+          if (is_server) {
+            post_receive_message(conn);
+            std::unique_lock<std::mutex> sync_num_lk(sync_num_mutex);
+            sync_num_cv.wait(sync_num_lk, [this] { return sync_num == finished_sync_num + 1; });
+            // flush_start_cv.wait(flush_start_lk, [this] { return flush_start; });
             send_message(conn, MSG_DATA);
+            sync_num_lk.unlock();
+            // flush_start_lk.unlock();
+          }
           else {
             send_message(conn, MSG_SYNC);
-            posted_sync = true;
+            std::unique_lock<std::mutex> lk(sync_num_mutex);
+            finished_sync_num += 1;
+            sync_num_cv.notify_one();
+            lk.unlock();
+            // posted_sync = false;
+            // posted_sync = true;
           }
           // send_msg_mutex.unlock();
         }
-        else if (conn->recv_msg->type == MSG_SYNC) {
+        else if (conn->recv_msg->type == MSG_SYNC) { // only server will recv this
           // printf("recv MSG_SYNC\n");
           // std::unique_lock<std::mutex> lk(sync_done_mutex);
           // sync_done = true;
           // sync_done_cv.notify_one();
           // lk.unlock();
+          post_receive_message(conn);
           std::unique_lock<std::mutex> lk(sync_num_mutex);
           finished_sync_num += 1;
           sync_num_cv.notify_one();
           lk.unlock();
-          post_receive_message(conn);
         }
         else
         {
@@ -700,13 +699,14 @@ namespace emp
         if (conn->send_state == SS_INIT)
         {
           conn->send_state = SS_MR_SENT;
+          send_ready = true;
         }
         else if (conn->send_state == SS_MR_SENT)
         {
-          std::unique_lock<std::mutex> send_ready_lock(send_ready_mutex);
-          send_ready = true;
-          send_ready_lock.unlock();
-          send_ready_cv.notify_one();
+          // std::unique_lock<std::mutex> send_ready_lock(send_ready_mutex);
+          // send_ready = true;
+          // send_ready_lock.unlock();
+          // send_ready_cv.notify_one();
           // printf("update completed msg num\n");
         }
         if (!is_server && posted_sync)
@@ -715,11 +715,6 @@ namespace emp
           // sync_done = true;
           // sync_done_cv.notify_one();
           // lk.unlock();
-          std::unique_lock<std::mutex> lk(sync_num_mutex);
-          finished_sync_num += 1;
-          sync_num_cv.notify_one();
-          lk.unlock();
-          posted_sync = false;
         }
         // std::unique_lock<std::mutex> msg_num_lock(msg_num_mutex);
         // completed_msg_num++;
@@ -733,17 +728,17 @@ namespace emp
       }
 
       if (conn->send_state == SS_MR_SENT && conn->recv_state == RS_MR_RECV && !initialized) {
-        std::unique_lock<std::mutex> party_ready_lock(party_ready_mutex);
+        // std::unique_lock<std::mutex> party_ready_lock(party_ready_mutex);
         // no need to wait
         party_ready = true;
-        party_ready_lock.unlock();
-        party_ready_cv.notify_one();
+        // party_ready_lock.unlock();
+        // party_ready_cv.notify_one();
         initialized = true;
 
-        std::unique_lock<std::mutex> send_ready_lock(send_ready_mutex);
-        send_ready = true;
-        send_ready_lock.unlock();
-        send_ready_cv.notify_one();
+        // std::unique_lock<std::mutex> send_ready_lock(send_ready_mutex);
+        // send_ready = true;
+        // send_ready_lock.unlock();
+        // send_ready_cv.notify_one();
       }
       if (conn->send_state == SS_DONE_SENT && conn->recv_state == RS_DONE_RECV && is_server)
       {
@@ -752,47 +747,50 @@ namespace emp
         rdma_disconnect(conn->id);
       }
     }
-
-    void sync()
+    void flush()
     {
-      printf("sync\n");
+      // printf("sync\n");
+      // std::unique_lock<std::mutex> lk1(sync_num_mutex);
       sync_num += 1;
-      flush();
-      // printf("waiting for sync done\n");
-      std::unique_lock<std::mutex> lk(sync_num_mutex);
-      sync_num_cv.wait(lk, [this] { return sync_num == finished_sync_num; });
-      lk.unlock();
-      printf("sync finished\n");
+      if (!is_server) {
+        printf("send MSG_DATA\n");
+        // post_receive_message(_conn_context);
+        send_message(_conn_context, MSG_DATA);
+      }
+      poll_cq_sndrecv(nullptr);
+      _conn_context->send_msg[1].size[0] = 0;
+      cur_message_index = 0;
+      cur_offset = 0;
+      // lk1.unlock();
+      // sync_num_cv.notify_one();
+      
+      // flush_start_mutex.lock();
+      // flush_start = true;
+      // flush_start_cv.notify_one();
+      // std::unique_lock<std::mutex> lk2(sync_num_mutex);
+
+      // sync_num_cv.wait(lk2, [this] { return sync_num == finished_sync_num; });
+      // cur_offset = 0;
+      // _conn_context->send_msg[1].size[0] = 0;
+      // cur_message_index = 0;
+      // lk2.unlock();
+      // printf("pending recv threads\n");
+      recv_data_sync();
+      // printf("all recv threads done\n");
+      // printf("sync finished\n");
+      // flush_start = false;
+      // flush_start_mutex.unlock();
     }
 
-    void flush()
+    void sync()
     { // ensure that all data is sent
       // printf("flush\n");
-      // send_ready_mutex.lock();
-      // while (true)
-      // {
-      //   send_ready_mutex.lock();
-      //   if (num_send_task == 0)
-      //   {
-      //     send_ready_mutex.unlock();
-      //     break;
-      //   }
-      //   else
-      //     send_ready_mutex.unlock();
-      // }
-      // cur_offset = 0;
-      // printf("flush done\n");
-      // send_msg_mutex.lock();
-      // _conn_context->send_msg[0].type=MSG_DATA;
       // printf("send MSG_DATA\n");
-      if (!is_server) {
-        send_message(_conn_context, MSG_DATA);
-        cur_message_index = 0;
-        cur_offset = 0;
+      // send_message(_conn_context, MSG_DATA);
         // _conn_context->send_msg[1].size[0] = 0;
-      }
       // send_msg_mutex.unlock();
       // send again to make sure that all data is received and stored in buffer
+      flush();
     }
 
     void build_connection(struct rdma_cm_id *id)
@@ -841,8 +839,8 @@ namespace emp
       TEST_NZ(
           ibv_req_notify_cq(s_ctx->cq, 0));
       // TEST_NZ(pthread_create(&s_ctx->cq_poller_thread, NULL, RDMAIO::poll_cq, NULL));
-      s_ctx->cq_poller_thread = new std::thread([this]()
-                                                { poll_cq_connect(NULL); });
+      // s_ctx->cq_poller_thread = new std::thread([this]()
+                                                // { poll_cq_connect(NULL); });
     }
 
     void poll_cq_connect(void *ctx)
@@ -852,57 +850,205 @@ namespace emp
 
       while (1)
       {
-        // printf("get cq event\n");
+        if (!cq_wc_queue.empty()) {
+          die("I assume cq_wc_queue is empty");
+        }
+        printf("get cq event\n");
         TEST_NZ(ibv_get_cq_event(s_ctx->comp_channel, &cq, &ctx));
+        printf("ack cq event\n");
         ibv_ack_cq_events(cq, 1);
+        printf("notify cq\n");
         TEST_NZ(ibv_req_notify_cq(cq, 0));
-        // printf("prepare to poll cq\n");
-        int num_comp = ibv_poll_cq(cq, 1, &wc);
+        printf("prepare to poll cq\n");
 
-        while (num_comp)
+        int num_comp = ibv_poll_cq(cq, 1, &wc);
+        while (num_comp && !party_ready)
         {
           // printf("num_comp: %d\n", num_comp);
           on_completion(&wc, is_server);
-          // printf("poll cq\n");
+          printf("poll cq again, party ready: %d\n", party_ready);
           num_comp = ibv_poll_cq(cq, 1, &wc);
           // printf("num_comp: %d\n", num_comp);
         }
 
+        if (num_comp) {
+          cq_wc_queue.push(wc);
+          while(ibv_poll_cq(cq, 1, &wc)) {
+            cq_wc_queue.push(wc);
+          }
+        }
+
         if (party_ready)
         {
-          // printf("party ready\n");
+          printf("party ready\n");
           break;
         }
       }
     }
 
+    // struct ibv_cq *cur_cq = nullptr;
+    std::queue<struct ibv_wc> cq_wc_queue;
+
     void poll_cq_sndrecv(void *ctx)
     {
-      struct ibv_cq *cq;
+      struct ibv_cq *cur_cq;
       struct ibv_wc wc;
-      while (1)
+      sync_state _sync_state = SYNC_WAIT_MSG_DATA;
+      while (_sync_state != SYNC_DONE)
       {
-        // printf("get cq event\n");
-        // auto start = std::chrono::high_resolution_clock::now();
-        TEST_NZ(ibv_get_cq_event(s_ctx->comp_channel, &cq, &ctx));
-        ibv_ack_cq_events(cq, 1);
-        TEST_NZ(ibv_req_notify_cq(cq, 0));
-        // auto end = std::chrono::high_resolution_clock::now();
-        // printf("=======================index: %d poll cq time: %ld us===================\n", poll_index, std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
-        poll_index++;
-        // printf("prepare to poll cq\n");
-        int num_comp = ibv_poll_cq(cq, 1, &wc);
+        if (!cq_wc_queue.empty()) {
+          printf("deal with old wc\n");
+          if (cq_wc_queue.size() > 1)
+            die("I assume that there is only one wc in the queue");
+          wc = cq_wc_queue.front();
+          cq_wc_queue.pop();
+          on_completion_sync(&wc, &_sync_state, is_server);
+          // int num_comp = ibv_poll_cq(cur_cq, 1, &wc);
 
-        while (num_comp)
-        {
-          on_completion(&wc, is_server);
-          // printf("poll cq\n");
-          num_comp = ibv_poll_cq(cq, 1, &wc);
-          // printf("num_comp: %d\n", num_comp);
+          // while (ibv_poll_cq(cur_cq, 1, &wc) && _sync_state != SYNC_DONE) {
+            // printf("deal with new cq\n");
+            // on_completion_sync(&wc, &_sync_state, is_server);
+          // }
         }
+        if (_sync_state == SYNC_DONE)
+          break;
+        printf("get cq event\n");
+        TEST_NZ(ibv_get_cq_event(s_ctx->comp_channel, &cur_cq, &ctx));
+        printf("ack event\n");
+        ibv_ack_cq_events(cur_cq, 1);
+        printf("notify cq\n");
+        TEST_NZ(ibv_req_notify_cq(cur_cq, 0));
+        printf("poll_cq\n");
+        
+        int num_comp = ibv_poll_cq(cur_cq, 1, &wc);
+        printf("out: num_comp: %d, state: %d\n", num_comp, _sync_state);
+        while (num_comp && _sync_state != SYNC_DONE)
+        {
+          on_completion_sync(&wc, &_sync_state, is_server);
+          printf("poll cq again\n");
+          num_comp = ibv_poll_cq(cur_cq, 1, &wc);
+          printf("num_comp: %d, state: %d\n", num_comp, _sync_state);
+        }
+        if (num_comp != 0)
+        {
+          cq_wc_queue.push(wc);
+          while(ibv_poll_cq(cur_cq, 1, &wc)) {
+            cq_wc_queue.push(wc);
+          }
+        }
+        // // printf("get cq event\n");
+        // if (_sync_state != SYNC_DONE) {
+        //   TEST_NZ(ibv_get_cq_event(s_ctx->comp_channel, &cur_cq, &ctx));
+        //   ibv_ack_cq_events(cur_cq, 1);
+        //   TEST_NZ(ibv_req_notify_cq(cur_cq, 0));
+        //   num_comp = ibv_poll_cq(cur_cq, 1, &wc);
+        //   // printf("poll cq done\n");
+        //   while (num_comp && _sync_state != SYNC_DONE)
+        //   {
+        //     on_completion_sync(&wc, &_sync_state, is_server);
+        //     // printf("poll cq again\n");
+        //     num_comp = ibv_poll_cq(cur_cq, 1, &wc);
+        //     // printf("num_comp: %d\n", num_comp);
+        //   }
+        // }
 
         if (party_done)
           break;
+      }
+    }
+    // void poll_cq_sndrecv(void *ctx)
+    // {
+    //   // struct ibv_cq *cq;
+    //   struct ibv_wc wc;
+    //   sync_state _sync_state = SYNC_WAIT_MSG_DATA;
+    //   while (_sync_state != SYNC_DONE)
+    //   {
+    //     if (cur_cq == nullptr) {
+    //       TEST_NZ(ibv_get_cq_event(s_ctx->comp_channel, &cur_cq, &ctx));
+    //       ibv_ack_cq_events(cur_cq, 1);
+    //       TEST_NZ(ibv_req_notify_cq(cur_cq, 0));
+    //     }
+    //     int num_comp = ibv_poll_cq(cur_cq, 1, &wc);
+
+    //     while (num_comp && _sync_state != SYNC_DONE)
+    //     {
+    //       on_completion_sync(&wc, &_sync_state, is_server);
+    //       // printf("poll cq again\n");
+    //       num_comp = ibv_poll_cq(cur_cq, 1, &wc);
+    //       // printf("num_comp: %d\n", num_comp);
+    //     }
+    //     // printf("get cq event\n");
+    //     if (_sync_state != SYNC_DONE) {
+    //       TEST_NZ(ibv_get_cq_event(s_ctx->comp_channel, &cur_cq, &ctx));
+    //       ibv_ack_cq_events(cur_cq, 1);
+    //       TEST_NZ(ibv_req_notify_cq(cur_cq, 0));
+    //       num_comp = ibv_poll_cq(cur_cq, 1, &wc);
+    //       // printf("poll cq done\n");
+    //       while (num_comp && _sync_state != SYNC_DONE)
+    //       {
+    //         on_completion_sync(&wc, &_sync_state, is_server);
+    //         // printf("poll cq again\n");
+    //         num_comp = ibv_poll_cq(cur_cq, 1, &wc);
+    //         // printf("num_comp: %d\n", num_comp);
+    //       }
+    //     }
+
+    //     if (party_done)
+    //       break;
+    //   }
+    // }
+
+    void on_completion_sync(struct ibv_wc *wc, sync_state *state, bool is_server) {
+      if (wc->status != IBV_WC_SUCCESS) {
+        printf("wc->status: %d\n", wc->status);
+        die("on_completion: wc->status is not IBV_WC_SUCCESS");
+      }
+
+      if (wc->opcode == IBV_WC_RECV) {
+        struct conn_context *conn = (struct conn_context *)wc->wr_id;
+        message *msg = conn->recv_msg;
+        if (msg->type == MSG_DATA && *state == SYNC_WAIT_MSG_DATA) {
+          printf("recv MSG_DATA\n");
+          // fetch data
+          uint cur_recv_offset = 0;
+          std::unique_lock<std::mutex> lk(recv_queue_mutex);
+          for (uint i = 0; i < MAX_MESSAGE_NUM; i++) {
+            uint size = conn->recv_msg->size[i];
+            if (size == 0) {
+              // printf("received %d messages\n", i);
+              break;
+            }
+            void *data = malloc(size);
+            // printf("cur_recv_offset: %d\n", cur_recv_offset);
+            memcpy(data, (char *)conn->rdma_remote_buffer + cur_recv_offset, size);
+            recv_task task(data, size);
+            // printf("push task \n");
+            recv_queue.push(task);
+            cur_recv_offset += size;
+          }
+          
+          post_receive_message(conn);
+          if (is_server) {
+            *state = SYNC_WAIT_SEND_DONE;
+            printf("send MSG_DATA\n");
+            send_message(conn, MSG_DATA);
+          } else {
+            *state = SYNC_DONE;
+          }
+        } else {
+          printf("error: unexpected message type: %d, state: %d\n", msg->type, *state);
+          die("on_completion: message type and state does not match, should be WAIT_MSG_DATA");
+        }
+      } else if (wc->opcode == IBV_WC_SEND) {
+        printf("send message done\n");
+        if (*state == SYNC_WAIT_SEND_DONE) {
+          *state = SYNC_DONE;
+        }
+      } else if (wc->opcode == IBV_WC_RDMA_WRITE) {
+        printf("rdma write done\n");
+      } else {
+        printf("error: unexpected opcode: %d\n", wc->opcode);
+        die("on_completion: opcode is not IBV_WC_SEND or IBV_WC_RECV");
       }
     }
 
@@ -927,50 +1073,9 @@ namespace emp
       while (!conn->connected)
         ;
 
+      // printf("send message MSG type: %d, cur_message_num: %d, length: %d\n", type, cur_message_index, conn->send_msg[1].size[0]);
       
-      // while (true)
-      // {
-      //   send_ready_mutex.lock();
-      //   if (send_ready || conn->send_state == SS_INIT)
-      //     break;
-      //   else
-      //   {
-      //     send_ready_mutex.unlock();
-      //     continue;
-      //   }
-      // }
-      // revise this part to event driven
-      // printf("check 1\n");
-      // printf("wait for send ready\n");
-      // std::unique_lock<std::mutex> lck(send_ready_mutex);
-      // send_ready_cv.wait(lck, [this, conn](){ return send_ready ||!initialized; });
-      // if (initialized)
-        // send_ready = false;
-      // printf("post send\n");
       TEST_NZ(ibv_post_send(conn->qp, &wr, &bad_wr));
-      // lck.unlock();
-      // printf("check 2\n");
-
-      // wait for send_ready
-      // std::unique_lock<std::mutex> lck2(send_ready_mutex);
-      // printf("check 2.1\n");
-      // send_ready_cv.wait(lck2, [this, conn](){ return send_ready ||!initialized; });
-      // printf("check 2.2\n");
-      // lck2.unlock();
-      // cur_message_index = 0;
-      // printf("check 3\n");
-      // printf("wait for this message finished\n");
-      // posted_msg_num++;
-      // std::unique_lock<std::mutex> lck2(msg_num_mutex);
-      // // printf("posted msg num: %d, completed msg num: %d\n", posted_msg_num, completed_msg_num);
-      // msg_num_cv.wait(lck2, [this, conn](){ return posted_msg_num == completed_msg_num; });
-      // lck2.unlock();
-
-      // printf("posted send msg data\n");
-      // printf("unset send_ready\n");
-      // send_ready = false;
-      // num_send_task += 1;
-      // send_ready_mutex.unlock();
     }
 
     void build_qp_attr(struct ibv_qp_init_attr *qp_attr)
@@ -981,8 +1086,8 @@ namespace emp
       qp_attr->recv_cq = s_ctx->cq;
       qp_attr->qp_type = IBV_QPT_RC;
 
-      qp_attr->cap.max_send_wr = 10;
-      qp_attr->cap.max_recv_wr = 10;
+      qp_attr->cap.max_send_wr = 100;
+      qp_attr->cap.max_recv_wr = 100;
       qp_attr->cap.max_send_sge = 1;
       qp_attr->cap.max_recv_sge = 1;
     }
@@ -1014,8 +1119,8 @@ namespace emp
     {
       memset(params, 0, sizeof(*params));
 
-      params->initiator_depth = params->responder_resources = 1;
-      params->rnr_retry_count = 7; /* infinite retry */
+      // params->initiator_depth = params->responder_resources = 1;
+      // params->rnr_retry_count = 7; /* infinite retry */
     }
   };
 

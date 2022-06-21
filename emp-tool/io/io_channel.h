@@ -33,8 +33,10 @@ class IOChannel { public:
 			A[i].group->resize_scratch(len);
 			unsigned char * tmp = A[i].group->scratch;
 			send_data(&len, 4);
+			derived().flush();
 			A[i].to_bin(tmp, len);
 			send_data(tmp, len);
+			derived().flush();
 		}
 	}
 
@@ -42,38 +44,44 @@ class IOChannel { public:
 		size_t len = 0;
 		for(size_t i = 0; i < num_pts; ++i) {
 			recv_data(&len, 4);
+			derived().flush();
 			assert(len <= 2048);
 			g->resize_scratch(len);
 			unsigned char * tmp = g->scratch;
 			recv_data(tmp, len);
+			derived().flush();
 			A[i].from_bin(g, tmp, len);
 		}
 	}	
 
 	void send_bool(bool * data, size_t length) {
-		void * ptr = (void *)data;
-		size_t space = length;
-		const void * aligned = std::align(alignof(uint64_t), sizeof(uint64_t), ptr, space);
-		if(aligned == nullptr)
-			send_data(data, length);
-		else{
-			size_t diff = length - space;
-			send_data(data, diff);
-			send_bool_aligned((const bool*)aligned, length - diff);
-		}
+		// void * ptr = (void *)data;
+		// size_t space = length;
+		// const void * aligned = std::align(alignof(uint64_t), sizeof(uint64_t), ptr, space);
+		// if(aligned == nullptr)
+		// 	send_data(data, length);
+		// else{
+		// 	size_t diff = length - space;
+		// 	send_data(data, diff);
+		// 	send_bool_aligned((const bool*)aligned, length - diff);
+		// }
+		send_data(data, length);
+		derived().flush();
 	}
 
 	void recv_bool(bool * data, size_t length) {
-		void * ptr = (void *)data;
-		size_t space = length;
-		void * aligned = std::align(alignof(uint64_t), sizeof(uint64_t), ptr, space);
-		if(aligned == nullptr)
-			recv_data(data, length);
-		else{
-			size_t diff = length - space;
-			recv_data(data, diff);
-			recv_bool_aligned((bool*)aligned, length - diff);
-		}
+		// void * ptr = (void *)data;
+		// size_t space = length;
+		// void * aligned = std::align(alignof(uint64_t), sizeof(uint64_t), ptr, space);
+		// if(aligned == nullptr)
+		// 	recv_data(data, length);
+		// else{
+		// 	size_t diff = length - space;
+		// 	recv_data(data, diff);
+		// 	recv_bool_aligned((bool*)aligned, length - diff);
+		// }
+		recv_data(data, length);
+		derived().flush();
 	}
 
 
