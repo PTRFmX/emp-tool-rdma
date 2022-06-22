@@ -86,6 +86,7 @@ namespace emp
 
   enum sync_state {
     SYNC_WAIT_MSG_DATA,
+    SYNC_WAIT_MSG_SYNC,
     SYNC_WAIT_SEND_DONE,
     SYNC_DONE
   };
@@ -375,6 +376,8 @@ namespace emp
       // printf("posted send data\n");
     }
 
+    uint pending_rdma_write = 0;
+
     void post_send_data(const void *data, int len, struct rdma_cm_id *id, uint32_t offset)
     {
 
@@ -398,11 +401,12 @@ namespace emp
       sge.lkey = conn->rdma_local_mr->lkey;
       // printf("post send rdma write\n");
       TEST_NZ(ibv_post_send(conn->qp, &wr, &bad_wr));
+      printf("post send first byte: %d\n", *(int *)data);
       // printf("set send_msg: %d, %d, at offset: %d\n", cur_message_index, len, offset);
       conn->send_msg[1].size[cur_message_index] = len; // MSG_DATA = 1
       cur_message_index += 1;
       conn->send_msg[1].size[cur_message_index] = 0; // set the next size as 0 to indicate the end of the message.
-      
+      pending_rdma_write += 1;
     }
 
     std::queue<std::thread> recv_threads_queue;
@@ -752,6 +756,7 @@ namespace emp
       // printf("sync\n");
       // std::unique_lock<std::mutex> lk1(sync_num_mutex);
       sync_num += 1;
+      printf("flush number: %d\n", sync_num);
       if (!is_server) {
         printf("send MSG_DATA\n");
         // post_receive_message(_conn_context);
@@ -1011,7 +1016,6 @@ namespace emp
           printf("recv MSG_DATA\n");
           // fetch data
           uint cur_recv_offset = 0;
-          std::unique_lock<std::mutex> lk(recv_queue_mutex);
           for (uint i = 0; i < MAX_MESSAGE_NUM; i++) {
             uint size = conn->recv_msg->size[i];
             if (size == 0) {
@@ -1019,8 +1023,14 @@ namespace emp
               break;
             }
             void *data = malloc(size);
-            // printf("cur_recv_offset: %d\n", cur_recv_offset);
+            printf("cur_recv_offset: %d\n", cur_recv_offset);
+            
             memcpy(data, (char *)conn->rdma_remote_buffer + cur_recv_offset, size);
+            if (size == 4) {
+              printf("get pointer data from remote, offset: %d size: %d\n", cur_recv_offset, *(int *) ((char *)conn->rdma_remote_buffer + cur_recv_offset));
+            } else {
+              printf("get data block from offset: %d, length: %d\n", cur_recv_offset, size);
+            }
             recv_task task(data, size);
             // printf("push task \n");
             recv_queue.push(task);
@@ -1029,9 +1039,22 @@ namespace emp
           
           post_receive_message(conn);
           if (is_server) {
-            *state = SYNC_WAIT_SEND_DONE;
-            printf("send MSG_DATA\n");
+            // *state = SYNC_WAIT_SEND_DONE;
+            *state = SYNC_WAIT_MSG_SYNC;
+            printf("pending rdma wirte: %d\n", pending_rdma_write);
+            // printf("send MSG_DATA\n");
             send_message(conn, MSG_DATA);
+          } else {
+            // printf("send MSG_SYNC\n");
+            send_message(conn, MSG_SYNC);
+            *state = SYNC_WAIT_MSG_SYNC;
+          }
+        } else if (msg->type == MSG_SYNC && *state == SYNC_WAIT_MSG_SYNC) {
+          post_receive_message(conn);
+          if (is_server) {
+            // printf("send MSG_SYNC\n");
+            send_message(conn, MSG_SYNC);
+            *state = SYNC_WAIT_SEND_DONE;
           } else {
             *state = SYNC_DONE;
           }
@@ -1040,12 +1063,18 @@ namespace emp
           die("on_completion: message type and state does not match, should be WAIT_MSG_DATA");
         }
       } else if (wc->opcode == IBV_WC_SEND) {
-        printf("send message done\n");
+        // printf("send message done\n");
         if (*state == SYNC_WAIT_SEND_DONE) {
           *state = SYNC_DONE;
         }
       } else if (wc->opcode == IBV_WC_RDMA_WRITE) {
-        printf("rdma write done\n");
+        pending_rdma_write -= 1;
+        // printf("rdma write done\n");
+        // if (is_server && pending_rdma_write == 0) {
+
+        // } else if (!is_server && pending_rdma_write == 0) {
+
+        // }
       } else {
         printf("error: unexpected opcode: %d\n", wc->opcode);
         die("on_completion: opcode is not IBV_WC_SEND or IBV_WC_RECV");
