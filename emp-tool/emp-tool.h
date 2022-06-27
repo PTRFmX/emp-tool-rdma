@@ -3,6 +3,7 @@
 #include "emp-tool/io/io_channel.h"
 #include "emp-tool/io/mem_io_channel.h"
 #include "emp-tool/io/net_io_channel.h"
+#include "emp-tool/io/rs_io_channel.h"
 #include "emp-tool/io/highspeed_net_io_channel.h"
 
 #include "emp-tool/circuits/bit.h"
