@@ -21,7 +21,7 @@ bool test_sndrecv(RDMAIO *io, uint32_t role, char *block, char *buffer, uint ite
         io->send_data(block, 1024); // client send data
     else
         io->recv_data((void *)buffer, 1024); // server recv data
-    io->sync();
+    io->flush();
     if (role == (iter % 4 < 2)) { // compare received data
         for (uint i = 0; i < 1024; ++i) {
             if (block[i] != buffer[i]) {
