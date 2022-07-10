@@ -11,6 +11,7 @@ using std::string;
 #include <rdma/rdma_cma.h>
 #include <netdb.h>
 #include <thread>
+#include <utility>
 
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -52,57 +53,96 @@ void die(const char *reason)
 }
 
 const int TIMEOUT_IN_MS = 500; /* ms */
-const size_t RDMA_BUFFER_SIZE = 1 << 30;
+#define RDMA_BUFFER_SIZE (1UL << 30)
 
-#define MAX_MESSAGE_NUM 1000
-#define TX_BUFFER_DEP 128
-uint poll_index = 0;
+#define TX_BUFFER_DEP 8192
 
 namespace emp
 {
 
+  using write_descriptor = std::pair<uint64_t, size_t>;
 
   struct ibv_send_wr *bad_wr = NULL;
   class StreamBuffer
   {
   public:
-    StreamBuffer(size_t size)
+    StreamBuffer()
     {
-      buffer = malloc(size);
-      buffer_len = size;
-      available_len = size;
+      buffer_len = RDMA_BUFFER_SIZE;
+      // first one: starting from current pos
+      // second one: possible need to recurve
+      pending_writes.resize(2, std::make_pair<uint64_t, size_t>(0, 0));
     }
 
     ~StreamBuffer()
     {
-      free(buffer);
+
     }
 
-    size_t write(const void *data, size_t len)
+    std::vector<write_descriptor> pending_writes;
+    std::vector<write_descriptor> get_pending_writes()
     {
-      if (available_len < len)
+      return pending_writes;
+    }
+
+    size_t pending_write_size()
+    {
+      return pending_writes[0].second + pending_writes[1].second;
+    }
+
+    void add_pending_write(size_t len)
+    {
+      if (pending_writes[0].first + pending_writes[0].second == buffer_len) {
+        // adding to the second
+        pending_writes[1].second += len;
+      } else {
+        // adding to the first
+        pending_writes[0].second += len;
+      }
+    }
+
+    void flush()
+    {
+      pending_writes[0].first = ppos;
+      pending_writes[0].second = 0;
+      pending_writes[1].first = 0;
+      pending_writes[1].second = 0;
+    }
+
+    void write(const void *data, size_t len)
+    {
+      if (pending_write_size() + len > buffer_len)
       {
         printf("buffer space not enough\n");
         die("exited");
       }
+      // std::vector<write_descriptor> res;
 
       if (ppos + len > buffer_len)
       {
         uint64_t first_block_size = buffer_len - ppos;
         uint64_t second_block_size = len - first_block_size;
         memcpy((char *)buffer + ppos, data, first_block_size);
+        // res.push_back(std::make_pair(ppos, first_block_size));
+        pending_writes[0].second += first_block_size;
         memcpy((char *)buffer, data, second_block_size);
+        // res.push_back(std::make_pair(0, second_block_size));
+        pending_writes[1].second += second_block_size;
         ppos = second_block_size;
       }
       else
       {
         memcpy((char *)buffer + ppos, data, len);
+        // res.push_back(std::make_pair(ppos, len));
+        pending_writes[0].second += len;
         ppos += len;
         ppos = ppos % buffer_len; // in case ppos is after the last one.
       }
       write_size_total += len;
-      available_len -= len;
-      return len;
+    }
+
+    char *get_addr(uint64_t pos) {
+      return (char *)buffer + pos;
     }
 
     size_t read(void *dst, size_t len)
@@ -130,7 +170,6 @@ namespace emp
         gpos = gpos % buffer_len; // in case ppos is after the last one.
       }
       read_size_total += len;
-      available_len += len;
       return len;
     }
 
@@ -144,12 +183,24 @@ namespace emp
       return write_size_total - read_size_total;
     }
 
-    uint64_t available_len = 0;    // data that can be write, in bytes
+    uint64_t available_len()
+    {
+      if (write_size_total - *remote_read_size_total_ptr > buffer_len)
+      {
+        printf("error: we have writen too much data to remote\n");
+        printf("write size total: %d, remote_read_size_total: %d\n", write_size_total, remote_read_size_total);
+        die("exited");
+      }
+      return write_size_total - *remote_read_size_total_ptr;
+    }
+
     uint64_t gpos = 0;             // read pointer
     uint64_t ppos = 0;             // write pointer
-    uint64_t write_size_total = 0; // total data writen, in bytes
-    uint64_t read_size_total = 0;  // total data read, in bytes
-    void *buffer;
+    volatile uint64_t write_size_total = 0; // total data writen, in bytes, need to write to the other side
+    volatile uint64_t read_size_total = 0;  // total data read, in bytes
+    volatile uint64_t remote_read_size_total = 0;
+    volatile uint64_t *remote_read_size_total_ptr = nullptr;
+    char buffer[RDMA_BUFFER_SIZE];
     size_t buffer_len;
   };
 
@@ -168,7 +219,6 @@ namespace emp
     {
       struct ibv_mr mr;
     } data;
-    // uint32_t size[MAX_MESSAGE_NUM];
     uint64_t size;
   };
 
@@ -179,14 +229,6 @@ namespace emp
     SS_WAIT_MSG_DATA,
     SS_SYNC_DONE,
     SS_DONE_SENT
-  };
-
-  enum sync_state
-  {
-    SYNC_WAIT_MSG_DATA,
-    SYNC_WAIT_MSG_SYNC,
-    SYNC_WAIT_SEND_DONE,
-    SYNC_DONE
   };
 
   enum r_state
@@ -234,18 +276,6 @@ namespace emp
     std::thread *cq_poller_thread;
   };
 
-  struct recv_task
-  {
-    recv_task(void *data, size_t len) : data(data), len(len) {}
-    recv_task()
-    {
-      data = nullptr;
-      len = 0;
-    }
-    void *data;
-    size_t len;
-  };
-
   class RDMAIO : public IOChannel<RDMAIO>
   {
   public:
@@ -255,32 +285,17 @@ namespace emp
 
     // party is ready for send & recv
     bool party_ready = false;
-    std::mutex party_ready_mutex;
-    std::condition_variable party_ready_cv;
     bool party_done = false;
     // party is ready for next send & recv
     bool send_ready = false;
-    std::mutex send_ready_mutex;
-    std::condition_variable send_ready_cv;
-
-    uint32_t posted_msg_num = 0;
-    uint32_t completed_msg_num = 0;
-    std::mutex msg_num_mutex;
-    std::condition_variable msg_num_cv;
-
-    bool sync_done = false;
-    std::mutex sync_done_mutex;
-    std::condition_variable sync_done_cv;
+    std::chrono::high_resolution_clock::time_point end;
 
     uint32_t sync_num = 0;
     uint32_t finished_sync_num = 0;
     std::mutex sync_num_mutex;
     std::condition_variable sync_num_cv;
 
-    std::mutex send_msg_mutex;
-
     bool initialized = false;
-    bool posted_sync = false;
 
     struct rdma_event_channel *ec = NULL;
     struct rdma_cm_id *listener = NULL;
@@ -289,16 +304,8 @@ namespace emp
     struct addrinfo *server_addr;
     struct context *s_ctx = NULL;
     struct conn_context *_conn_context = NULL;
-    std::queue<recv_task> recv_queue;
-    std::mutex recv_queue_mutex;
-    std::condition_variable recv_queue_cv;
-
-    bool flush_start = false;
-    std::mutex flush_start_mutex;
-    std::condition_variable flush_start_cv;
 
     uint cur_offset = 0;
-    uint cur_message_index = 0;
 
     StreamBuffer *sbuf = nullptr;
     std::mutex sbuf_mutex;
@@ -306,7 +313,7 @@ namespace emp
 
     RDMAIO(const char *address, int port, bool quiet = false)
     {
-      sbuf = new StreamBuffer(RDMA_BUFFER_SIZE);
+      sbuf = new StreamBuffer();
       is_server = (address == nullptr);
       if (is_server)
       {
@@ -462,69 +469,155 @@ namespace emp
 
     void send_data_internal(const void *data, size_t len)
     {
-      if (cur_offset + len > RDMA_BUFFER_SIZE)
-      {
-        die("send_data: buffer overflow.");
-      }
-
-      post_send_data(data, len, _conn_context->id, cur_offset);
-      cur_offset += len;
+      
+      StreamBuffer *buf = (StreamBuffer *)_conn_context->rdma_local_buffer;
+      buf->write(data, len);
+      // for (auto &wd: wds) {
+      //   post_send_data(wd.first, wd.second, _conn_context->id);
+      //   // cur_offset += wd.second;
+      // }
       has_sent = true;
     }
 
     uint64_t posted_rdma_write = 0;
 
     uint64_t posted_send_wr = 0;
-    uint64_t completed_send_wr = 0;
+    volatile uint64_t completed_send_wr = 0;
     std::mutex send_wr_mutex;
     std::condition_variable send_wr_cv;
 
-    void post_send_data(const void *data, int len, struct rdma_cm_id *id, uint32_t offset)
+    void post_send_data(const uint64_t pos, int len, struct rdma_cm_id *id)
     {
 
       struct conn_context *conn = (struct conn_context *)id->context;
-      struct ibv_send_wr wr;//, *bad_wr = NULL;
+      struct ibv_send_wr wr;
       struct ibv_sge sge;
 
-      memcpy(((char *)conn->rdma_local_buffer + offset), data, len);
+      StreamBuffer *remote_sbf = (StreamBuffer *)conn->peer_mr.addr;
+      StreamBuffer *local_sbf = (StreamBuffer *)conn->rdma_local_buffer;
+
       memset(&wr, 0, sizeof(wr));
 
       wr.wr_id = (uintptr_t)conn;
       wr.opcode = IBV_WR_RDMA_WRITE;
       wr.sg_list = &sge;
       wr.num_sge = 1;
-      wr.next = NULL;
       wr.send_flags = IBV_SEND_SIGNALED;
-      wr.wr.rdma.remote_addr = (uintptr_t)((char *)conn->peer_mr.addr + offset);
+      wr.wr.rdma.remote_addr = (uintptr_t)(remote_sbf->get_addr(pos));
       wr.wr.rdma.rkey = conn->peer_mr.rkey;
 
-      sge.addr = (uintptr_t)((char *)conn->rdma_local_buffer + offset);
+      sge.addr = (uintptr_t)(local_sbf->get_addr(pos));
       sge.length = len;
       sge.lkey = conn->rdma_local_mr->lkey;
-      // printf("post send rdma write\n");
-      // TEST_NZ(ibv_post_send(conn->qp, &wr, &bad_wr));
 
-      std::unique_lock<std::mutex> lck(send_wr_mutex);
-      send_wr_cv.wait(lck, [this]() {return posted_send_wr - completed_send_wr < TX_BUFFER_DEP;});
+      while (posted_send_wr - completed_send_wr >= TX_BUFFER_DEP)
+        ;
+
+      posted_rdma_write += 1;
+
+      // check wether we can write to the remote side without overwriting unread data
+      while(local_sbf->available_len() < len)
+        ;
 
       auto post_res = ibv_post_send(conn->qp, &wr, &bad_wr);
       posted_send_wr += 1;
       if (post_res != 0) {
         printf("ibv_post_send returned: %d\n", post_res);
         printf("errno message: %s\n", strerror(errno));
-        getchar();
       }
-      lck.unlock();
 
-      conn->send_msg[1].size += len;
-      cur_message_index += 1;
-      // conn->send_msg[1].size[cur_message_index] = 0; // set the next size as 0 to indicate the end of the message.
-      posted_rdma_write += 1;
     }
 
-    std::queue<std::thread> recv_threads_queue;
-    std::queue<recv_task> pending_recv_task_queue;
-    std::mutex pending_recv_task_mutex;
+    void dump_data() 
+    {
+      printf("dump remote rdma buffer\n");
+      StreamBuffer *remote_sbuf = (StreamBuffer *)_conn_context->rdma_remote_buffer;
+      StreamBuffer *local_sbuf = (StreamBuffer *)_conn_context->rdma_local_buffer;
+      printf("remote sbuf: \n");
+      printf("%s\n", (char *)remote_sbuf->buffer);
+      printf("write_len: %d\n", remote_sbuf->write_size_total);
+      printf("read_len: %d\n", remote_sbuf->read_size_total);
+      if (remote_sbuf->remote_read_size_total_ptr != nullptr)
+        printf("remote read_size_total: %d\n", *(remote_sbuf->remote_read_size_total_ptr));
+
+      printf("local sbuf: \n");
+      printf("%s\n", (char *)local_sbuf->buffer);
+      printf("write_len: %d\n", local_sbuf->write_size_total);
+      printf("read_len: %d\n", local_sbuf->read_size_total);
+      if (local_sbuf->remote_read_size_total_ptr != nullptr)
+        printf("remote read_size_total: %d\n", *(local_sbuf->remote_read_size_total_ptr));
+      
+    }
+
+    void post_send_write_len()
+    {
+      struct conn_context *conn = _conn_context;
+      struct ibv_send_wr wr;
+      struct ibv_sge sge;
+
+      StreamBuffer *remote_sbf = (StreamBuffer *)conn->peer_mr.addr;
+      StreamBuffer *local_sbf = (StreamBuffer *)conn->rdma_local_buffer;
+
+      memset(&wr, 0, sizeof(wr));
+
+      wr.wr_id = (uintptr_t)conn;
+      wr.opcode = IBV_WR_RDMA_WRITE;
+      wr.sg_list = &sge;
+      wr.num_sge = 1;
+      wr.send_flags = IBV_SEND_SIGNALED;
+      wr.wr.rdma.remote_addr = (uintptr_t)&(remote_sbf->write_size_total);
+      wr.wr.rdma.rkey = conn->peer_mr.rkey;
+
+      sge.addr = (uintptr_t)&(local_sbf->write_size_total);
+      sge.length = sizeof(local_sbf->write_size_total);
+      sge.lkey = conn->rdma_local_mr->lkey;
+
+      while (posted_send_wr - completed_send_wr >= TX_BUFFER_DEP)
+        ;
+
+      posted_rdma_write += 1;
+      auto post_res = ibv_post_send(conn->qp, &wr, &bad_wr);
+      posted_send_wr += 1;
+      if (post_res != 0) {
+        printf("ibv_post_send returned: %d\n", post_res);
+        printf("errno message: %s\n", strerror(errno));
+      }
+    }
+
+    void post_send_read_len()
+    {
+      struct conn_context *conn = _conn_context;
+      struct ibv_send_wr wr;
+      struct ibv_sge sge;
+
+      StreamBuffer *remote_sbf = (StreamBuffer *)conn->peer_mr.addr;
+      StreamBuffer *local_sbf = (StreamBuffer *)conn->rdma_remote_buffer;
+
+      memset(&wr, 0, sizeof(wr));
+
+      wr.wr_id = (uintptr_t)conn;
+      wr.opcode = IBV_WR_RDMA_WRITE;
+      wr.sg_list = &sge;
+      wr.num_sge = 1;
+      wr.send_flags = IBV_SEND_SIGNALED;
+      wr.wr.rdma.remote_addr = (uintptr_t)&(remote_sbf->remote_read_size_total);
+      wr.wr.rdma.rkey = conn->peer_mr.rkey;
+
+      sge.addr = (uintptr_t)&(local_sbf->read_size_total);
+      sge.length = sizeof(local_sbf->read_size_total);
+      sge.lkey = conn->rdma_remote_mr->lkey;
+
+      while (posted_send_wr - completed_send_wr >= TX_BUFFER_DEP)
+        ;
+
+      posted_rdma_write += 1;
+      auto post_res = ibv_post_send(conn->qp, &wr, &bad_wr);
+      posted_send_wr += 1;
+      if (post_res != 0) {
+        printf("ibv_post_send returned: %d\n", post_res);
+        printf("errno message: %s\n", strerror(errno));
+      }
+    }
 
     void recv_data_internal(void *data, size_t len)
     {
@@ -532,11 +625,14 @@ namespace emp
       if (has_sent)
         flush();
       // blocking
-      std::unique_lock<std::mutex> lck(sbuf_mutex);
-      sbuf_cv.wait(lck, [this, len] () {return sbuf->data_len() >= len;});
+      StreamBuffer *remote_sbf = (StreamBuffer *) _conn_context->rdma_remote_buffer;
 
-      sbuf->read(data, len);
-      lck.unlock();
+      while(remote_sbf->data_len() < len)
+        ;
+      
+      remote_sbf->read(data, len);
+      post_send_read_len();
+
     }
 
     int on_addr_resolved(struct rdma_cm_id *id)
@@ -559,8 +655,12 @@ namespace emp
       conn->send_msg[3].type = MSG_DONE;
       conn->recv_msg = (message *)malloc(sizeof(struct message) * 2);
 
-      conn->rdma_local_buffer = (char *)malloc(RDMA_BUFFER_SIZE);
-      conn->rdma_remote_buffer = (char *)malloc(RDMA_BUFFER_SIZE);
+      conn->rdma_local_buffer = (char *) new StreamBuffer();
+      conn->rdma_remote_buffer = (char *) new StreamBuffer();
+      StreamBuffer *local_sbf = (StreamBuffer *)conn->rdma_local_buffer;
+      StreamBuffer *remote_sbf = (StreamBuffer *)conn->rdma_remote_buffer;
+      // in this way, we can check wether we can write to the next one
+      local_sbf->remote_read_size_total_ptr = &remote_sbf->remote_read_size_total;
 
       TEST_Z(conn->send_mr = ibv_reg_mr(
                  s_ctx->pd,
@@ -577,13 +677,13 @@ namespace emp
       TEST_Z(conn->rdma_local_mr = ibv_reg_mr(
                  s_ctx->pd,
                  conn->rdma_local_buffer,
-                 RDMA_BUFFER_SIZE,
+                 sizeof(StreamBuffer),
                  0));
 
       TEST_Z(conn->rdma_remote_mr = ibv_reg_mr(
                  s_ctx->pd,
                  conn->rdma_remote_buffer,
-                 RDMA_BUFFER_SIZE,
+                 sizeof(StreamBuffer),
                  (IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE)));
     }
 
@@ -713,45 +813,7 @@ namespace emp
         }
         else if (conn->recv_msg->type == MSG_DATA)
         {
-          // printf("recv MSG_DATA\n");
-          uint cur_recv_offset = 0;
-          std::unique_lock<std::mutex> lk(recv_queue_mutex);
-          
-          uint size = conn->recv_msg->size;
-          if (size > 0)
-          {
-            void *data = malloc(size);
-            // printf("cur_recv_offset: %d\n", cur_recv_offset);
-            memcpy(data, (char *)conn->rdma_remote_buffer + cur_recv_offset, size);
-            recv_task task(data, size);
-            // printf("push task \n");
-            recv_queue.push(task);
-            cur_recv_offset += size;
-            lk.unlock();
-            recv_queue_cv.notify_one();
-          }
-          if (is_server)
-          {
-            post_receive_message(conn);
-            std::unique_lock<std::mutex> sync_num_lk(sync_num_mutex);
-            sync_num_cv.wait(sync_num_lk, [this]
-                             { return sync_num == finished_sync_num + 1; });
-            // flush_start_cv.wait(flush_start_lk, [this] { return flush_start; });
-            send_message(conn, MSG_DATA);
-            sync_num_lk.unlock();
-            // flush_start_lk.unlock();
-          }
-          else
-          {
-            send_message(conn, MSG_SYNC);
-            std::unique_lock<std::mutex> lk(sync_num_mutex);
-            finished_sync_num += 1;
-            sync_num_cv.notify_one();
-            lk.unlock();
-            // posted_sync = false;
-            // posted_sync = true;
-          }
-          // send_msg_mutex.unlock();
+          die("It should not recv MSG_DATA");
         }
         else if (conn->recv_msg->type == MSG_SYNC)
         { // only server will recv this
@@ -792,23 +854,8 @@ namespace emp
         }
         else if (conn->send_state == SS_MR_SENT)
         {
-          // std::unique_lock<std::mutex> send_ready_lock(send_ready_mutex);
-          // send_ready = true;
-          // send_ready_lock.unlock();
-          // send_ready_cv.notify_one();
-          // printf("update completed msg num\n");
+
         }
-        if (!is_server && posted_sync)
-        {
-          // std::unique_lock<std::mutex> lk(sync_done_mutex);
-          // sync_done = true;
-          // sync_done_cv.notify_one();
-          // lk.unlock();
-        }
-        // std::unique_lock<std::mutex> msg_num_lock(msg_num_mutex);
-        // completed_msg_num++;
-        // msg_num_cv.notify_one();
-        // msg_num_lock.unlock();
       }
       else
       { // other opcodes
@@ -818,7 +865,6 @@ namespace emp
 
       if (conn->send_state == SS_MR_SENT && conn->recv_state == RS_MR_RECV && !initialized)
       {
-        // std::unique_lock<std::mutex> party_ready_lock(party_ready_mutex);
         // no need to wait
         party_ready = true;
         initialized = true;
@@ -835,24 +881,31 @@ namespace emp
     {
       // first check the sync num
       sync_num += 1;
-      std::unique_lock<std::mutex> lck1(rdma_write_num_mutex);
-      rdma_write_num_cv.wait(lck1, [this]()
-                             { return posted_rdma_write == num_completed_write; });
 
-      send_message(_conn_context, MSG_DATA);
-      lck1.unlock();
+      StreamBuffer *local_sbf = (StreamBuffer *)(_conn_context->rdma_local_buffer);
+      auto pending_wds = local_sbf->get_pending_writes();
 
-      std::unique_lock<std::mutex> lck2(sync_num_mutex);
-      sync_num_cv.wait(lck2, [this]()
-                       { return sync_num == finished_sync_num; });
-      _conn_context->send_msg[1].size = 0;
-      cur_message_index = 0;
-      cur_offset = 0;
+      for (auto &wd : pending_wds) {
+        if (wd.second != 0) {
+          post_send_data(wd.first, wd.second, _conn_context->id);
+        }
+      }
+
+      while(posted_rdma_write != num_completed_write) {
+        // ibv_poll_cq(s_ctx->send_cq, )
+        ;
+      }
+      end = std::chrono::high_resolution_clock::now();
+
+      post_send_write_len();
+
+
+      while(posted_rdma_write != num_completed_write) {
+        ;
+      }
       has_sent = false;
-      lck2.unlock();
+      local_sbf->flush();
     }
-    // bool sync_done = false;
-    // std::mutex sync_done_mutex;
 
     void sync()
     {
@@ -906,8 +959,9 @@ namespace emp
           s_ctx->comp_channel = ibv_create_comp_channel(s_ctx->ctx));
       TEST_Z(
           s_ctx->send_cq = ibv_create_cq(s_ctx->ctx, TX_BUFFER_DEP, NULL, s_ctx->comp_channel, 0)); /* cqe=10 is arbitrary */
-      TEST_Z(
-          s_ctx->recv_cq = ibv_create_cq(s_ctx->ctx, TX_BUFFER_DEP, NULL, s_ctx->comp_channel, 0)); /* cqe=10 is arbitrary */
+      // TEST_Z(
+          // s_ctx->recv_cq = ibv_create_cq(s_ctx->ctx, TX_BUFFER_DEP, NULL, s_ctx->comp_channel, 0)); /* cqe=10 is arbitrary */
+      s_ctx->recv_cq = s_ctx->send_cq;
       TEST_NZ(
           ibv_req_notify_cq(s_ctx->send_cq, 0));
       TEST_NZ(
@@ -966,9 +1020,7 @@ namespace emp
     // struct ibv_cq *cur_cq = nullptr;
     std::queue<struct ibv_wc> cq_wc_queue;
 
-    uint64_t num_completed_write = 0;
-    std::mutex rdma_write_num_mutex;
-    std::condition_variable rdma_write_num_cv;
+    volatile uint64_t num_completed_write = 0;
 
     void poll_cq_flush(void *ctx)
     {
@@ -980,12 +1032,25 @@ namespace emp
         die("I assume wc queue should be empty");
       }
 
+      // while (1)
+      // {
+      //   TEST_NZ(ibv_get_cq_event(s_ctx->comp_channel, &cur_cq, &ctx));
+      //   ibv_ack_cq_events(cur_cq, 1);
+      //   TEST_NZ(ibv_req_notify_cq(cur_cq, 0));
+      //   while (ibv_poll_cq(cur_cq, 1, &wc))
+      //   {
+      //     on_completion_flush(&wc);
+      //   }
+
+      //   if (party_done)
+      //     break;
+      // }
       while (1)
       {
-        TEST_NZ(ibv_get_cq_event(s_ctx->comp_channel, &cur_cq, &ctx));
-        ibv_ack_cq_events(cur_cq, 1);
-        TEST_NZ(ibv_req_notify_cq(cur_cq, 0));
-        while (ibv_poll_cq(cur_cq, 1, &wc))
+        // TEST_NZ(ibv_get_cq_event(s_ctx->comp_channel, &cur_cq, &ctx));
+        // ibv_ack_cq_events(cur_cq, 1);
+        // TEST_NZ(ibv_req_notify_cq(cur_cq, 0));
+        while (ibv_poll_cq(s_ctx->recv_cq, 1, &wc))
         {
           on_completion_flush(&wc);
         }
@@ -1015,34 +1080,17 @@ namespace emp
 
         if (recv_msg->type == MSG_DATA)
         {
+          printf("receive deprecated msg type\n");
+          die("failed\n");
           // proceed data
-          // printf("recved MSG_DATA\n");
-          // recv_queue_mutex.lock();
-          sbuf_mutex.lock();
+          // sbuf_mutex.lock();
           
-          uint size = recv_msg->size;
-          if (size > 0)
-          {
-            // printf("received message size: %d\n", size);
-            sbuf->write((char *)conn->rdma_remote_buffer, size);
-            // printf("get data block, length: %d\n", size);
-          }
-
-          sbuf_mutex.unlock();
-          sbuf_cv.notify_one();
-          // recv_queue_cv.notify_one();
-
-          post_receive_message(conn);
-          send_message(conn, MSG_SYNC);
         }
         else if (recv_msg->type == MSG_SYNC)
         {
-          std::unique_lock<std::mutex> lck2(sync_num_mutex);
-          finished_sync_num += 1;
-          sync_num_cv.notify_one();
-          lck2.unlock();
-
-          post_receive_message(conn);
+          printf("receive deprecated msg type\n");
+          die("failed\n");
+          // post_receive_message(conn);
         }
         else if (recv_msg->type == MSG_DONE)
         {
@@ -1057,24 +1105,12 @@ namespace emp
       else if (wc->opcode == IBV_WC_RDMA_WRITE)
       {
         // RDMA write finished
-        // update num_completed_write
-        std::unique_lock<std::mutex> lck(rdma_write_num_mutex);
         num_completed_write += 1;
-        rdma_write_num_cv.notify_one();
-        
-        std::unique_lock<std::mutex> lck2(send_wr_mutex);
         completed_send_wr += 1;
-        lck2.unlock();
-        send_wr_cv.notify_one();
       }
       else if (wc->opcode == IBV_WC_SEND)
       {
-        // send message finished
-        // pass
-        std::unique_lock<std::mutex> lck(send_wr_mutex);
         completed_send_wr += 1;
-        lck.unlock();
-        send_wr_cv.notify_one();
       }
       else
       {
@@ -1103,20 +1139,18 @@ namespace emp
       sge.lkey = conn->send_mr->lkey;
       if (type == MSG_DATA)
       {
-        // printf("sending message length: %d\n", conn->send_msg[1].size);
+        printf("MSG DATA is deprecated\n");
+        die("failed\n");
       }
 
       while (!conn->connected)
         ;
 
-      // printf("send message MSG type: %d, cur_message_num: %d, length: %d\n", type, cur_message_index, conn->send_msg[1].size[0]);
-      std::unique_lock<std::mutex> lck(send_wr_mutex);
-      send_wr_cv.wait(lck, [this]() {return posted_send_wr - completed_send_wr < TX_BUFFER_DEP;});
-
+      while (posted_send_wr - completed_send_wr >= TX_BUFFER_DEP)
+        ;
       TEST_NZ(ibv_post_send(conn->qp, &wr, &bad_wr));
       posted_send_wr += 1;
 
-      lck.unlock();
     }
 
     void build_qp_attr(struct ibv_qp_init_attr *qp_attr)

@@ -34,6 +34,8 @@ add_test_case(halfgate)
 add_test_case(to_bool)
 add_test_case(aes_opt)
 add_test_case(test_rdmaio)
+add_test_case(rdmaio_perf)
+add_test_case(tcp_perf)
 
 IF(${CRYPTO_IN_CIRCUIT})
 add_test_case(sha3_256)

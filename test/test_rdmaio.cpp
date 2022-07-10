@@ -2,6 +2,7 @@
 #include <iostream>
 #include <string>
 #include <cstdio>
+#include <string.h>
 
 using namespace emp;
 
@@ -105,17 +106,7 @@ void simulate_ot(RDMAIO *io, uint32_t role, uint32_t length) {
     }
 }
 
-
-int main(int argc, char **argv) {
-    if (argc < 4) {
-        std::cout << "Usage: ./test_rdmaio <role> <host> <port>" << std::endl;
-        return -1;
-    }
-    uint role = atoi(argv[1]);
-    std::string host = argv[2];
-    uint port = atoi(argv[3]);
-
-    RDMAIO *io = new RDMAIO(role == 0? nullptr: host.c_str(), port);
+void check_correctness(RDMAIO *io, uint32_t role) {
 
     char *buffer = new char[1024];
     bool success = true;
@@ -140,8 +131,39 @@ int main(int argc, char **argv) {
 
     // simulate_ot(io, role, 128);
 
-    delete io;
     delete [] buffer;
+
+}
+
+void check_write(RDMAIO *io, uint32_t role) {
+    char *buffer = new char[1024];
+    if (role == 0) {
+        strcpy(buffer, "hello");
+        io->send_data_internal(buffer, 5);
+    } else {
+        io->recv_data_internal(buffer, 5);
+        printf("sleep\n");
+    }
+    io->sync();
+    sleep(1);
+    io->dump_data();
+}
+
+
+int main(int argc, char **argv) {
+    if (argc < 4) {
+        std::cout << "Usage: ./test_rdmaio <role> <host> <port>" << std::endl;
+        return -1;
+    }
+    uint role = atoi(argv[1]);
+    std::string host = argv[2];
+    uint port = atoi(argv[3]);
+
+    RDMAIO *io = new RDMAIO(role == 0? nullptr: host.c_str(), port);
+
+    // check_write(io, role);
+    check_correctness(io, role);
+    delete io;
 
     // for (uint i = 0; i < 200; i++) {
     //     printf("flush %d\n", i);
