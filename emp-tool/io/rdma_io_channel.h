@@ -504,18 +504,17 @@ namespace emp
       local_sbf->flush();
 
       has_sent = true;
-      // write_accumulated += len;
-      // write_accumulated_msg += 1;
-      // if (write_accumulated > UPDATE_WRITE_FACTOR_SIZE || write_accumulated_msg >= UPDATE_WRITE_FACTOR_MSG) {
+      write_accumulated += len;
+      write_accumulated_msg += 1;
+      if (write_accumulated > UPDATE_WRITE_FACTOR_SIZE || write_accumulated_msg >= UPDATE_WRITE_FACTOR_MSG) {
         // printf("too much data, flush\n");
-        // flush();
+        flush();
         // printf("flush finished\n");
-      // }
+      }
     }
 
     uint64_t posted_rdma_write = 0;
 
-    // uint64_t posted_send_wr = 0;
     volatile uint64_t completed_send_wr = 0;
     uint64_t post_send_data_time = 0;
     uint64_t wait_remote_read_time = 0;
@@ -526,7 +525,7 @@ namespace emp
     void post_send_data(std::vector<write_descriptor>& wds, struct rdma_cm_id *id)
     {
       // printf("post send data\n");
-      auto start = clock_start();
+      // auto start = clock_start();
       struct conn_context *conn = (struct conn_context *)id->context;
       struct ibv_send_wr wr[2], wr_update_write, *last_send_wr;
       struct ibv_sge sge[3];
@@ -554,7 +553,6 @@ namespace emp
           sge[i].addr = (uintptr_t)(local_sbf->get_addr(wds[i].first));
           sge[i].length = wds[i].second;
           sge[i].lkey = conn->rdma_local_mr->lkey;
-          // posted_send_wr += 1;
           posted_rdma_write += 1;
           last_send_wr = &wr[i];
 
@@ -564,24 +562,24 @@ namespace emp
         }
       }
       // printf("generate send write len\n");
+// set wr_update
+      // wr_update_write.wr_id = (uintptr_t)conn;
+      // wr_update_write.opcode = IBV_WR_RDMA_WRITE;
+      // wr_update_write.sg_list = &sge[2];
+      // wr_update_write.num_sge = 1;
+      // wr_update_write.send_flags = IBV_SEND_SIGNALED | IBV_SEND_FENCE;
+      // // printf("check1\n");
+      // wr_update_write.wr.rdma.remote_addr = (uintptr_t)&(remote_sbf->write_size_total);
+      // // printf("check2\n");
+      // wr_update_write.wr.rdma.rkey = conn->peer_mr.rkey;
+      // // printf("generate write\n");
+      // sge[2].addr = (uintptr_t)(local_sbf->get_write_size_total());
+      // sge[2].length = sizeof(local_sbf->write_size_total);
+      // sge[2].lkey = conn->rdma_local_mr->lkey;
+      // posted_rdma_write += 1;
 
-      wr_update_write.wr_id = (uintptr_t)conn;
-      wr_update_write.opcode = IBV_WR_RDMA_WRITE;
-      wr_update_write.sg_list = &sge[2];
-      wr_update_write.num_sge = 1;
-      wr_update_write.send_flags = IBV_SEND_SIGNALED | IBV_SEND_FENCE;
-      // printf("check1\n");
-      wr_update_write.wr.rdma.remote_addr = (uintptr_t)&(remote_sbf->write_size_total);
-      // printf("check2\n");
-      wr_update_write.wr.rdma.rkey = conn->peer_mr.rkey;
-      // printf("generate write\n");
-      sge[2].addr = (uintptr_t)(local_sbf->get_write_size_total());
-      sge[2].length = sizeof(local_sbf->write_size_total);
-      sge[2].lkey = conn->rdma_local_mr->lkey;
-      posted_rdma_write += 1;
-
-      last_send_wr->next = &wr_update_write;
-
+      // last_send_wr->next = &wr_update_write;
+// end of set wr 
       // auto set_wr = clock_start();
 
       // check wether we can write to the remote side without overwriting unread data
@@ -596,17 +594,17 @@ namespace emp
         ;
       }
       // wait_tx_buffer_time += time_from(wait_buf_start);
-      set_wr_time += time_from(start);
+      // set_wr_time += time_from(start);
       
-      auto post_send_start = clock_start();
+      // auto post_send_start = clock_start();
       auto post_res = ibv_post_send(conn->qp, &wr[0], &bad_wr);
       if (post_res != 0) {
         printf("ibv_post_send returned: %d\n", post_res);
         printf("errno message: %s\n", strerror(errno));
       }
       
-      ibv_post_send_time += time_from(post_send_start);
-      post_send_data_time += time_from(start);
+      // ibv_post_send_time += time_from(post_send_start);
+      // post_send_data_time += time_from(start);
     }
 
     void reset_time_counter() {
@@ -662,7 +660,7 @@ namespace emp
       wr.opcode = IBV_WR_RDMA_WRITE;
       wr.sg_list = &sge;
       wr.num_sge = 1;
-      wr.send_flags = IBV_SEND_SIGNALED;
+      wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_FENCE;
       wr.wr.rdma.remote_addr = (uintptr_t)&(remote_sbf->write_size_total);
       wr.wr.rdma.rkey = conn->peer_mr.rkey;
 
@@ -670,17 +668,17 @@ namespace emp
       sge.length = sizeof(local_sbf->write_size_total);
       sge.lkey = conn->rdma_local_mr->lkey;
       // printf("make sure all writes finished: %d, %d\n", posted_rdma_write, num_completed_write);
-      while(posted_rdma_write != num_completed_write) {
-        ;
-      }
+      // while(posted_rdma_write != num_completed_write) {
+      //   ;
+      // }
       // printf("wait finished\n");
 
-      // while (posted_send_wr - completed_send_wr >= TX_BUFFER_DEP)
-        // ;
-
-      auto post_res = ibv_post_send(conn->qp, &wr, &bad_wr);
       posted_rdma_write += 1;
-      // posted_send_wr += 1;
+      while (posted_rdma_write - num_completed_write >= TX_BUFFER_DEP)
+        ;
+      auto post_res = ibv_post_send(conn->qp, &wr, &bad_wr);
+
+
       if (post_res != 0) {
         printf("ibv_post_send returned: %d\n", post_res);
         printf("errno message: %s\n", strerror(errno));
@@ -711,15 +709,13 @@ namespace emp
       sge.length = sizeof(local_sbf->read_size_total);
       sge.lkey = conn->rdma_remote_mr->lkey;
 
-      // while (posted_send_wr - completed_send_wr >= TX_BUFFER_DEP)
-        // ;
       while(posted_rdma_write - num_completed_write >= TX_BUFFER_DEP) {
         ;
       }
 
       posted_rdma_write += 1;
       auto post_res = ibv_post_send(conn->qp, &wr, &bad_wr);
-      // posted_send_wr += 1;
+
       if (post_res != 0) {
         printf("ibv_post_send returned: %d\n", post_res);
         printf("errno message: %s\n", strerror(errno));
@@ -985,27 +981,27 @@ namespace emp
       // first check the sync num
       sync_num += 1;
 
-      // StreamBuffer *local_sbf = (StreamBuffer *)(_conn_context->rdma_local_buffer);
-      // auto pending_wds = local_sbf->get_pending_writes();
+      StreamBuffer *local_sbf = (StreamBuffer *)(_conn_context->rdma_local_buffer);
+      auto pending_wds = local_sbf->get_pending_writes();
 
-      // // for (auto &wd : pending_wds) {
-      // //   if (wd.second != 0) {
-      // //     post_send_data(wd.first, wd.second, _conn_context->id);
-      // //   }
-      // // }
-      // post_send_data(pending_wds, _conn_context->id);
+      // for (auto &wd : pending_wds) {
+      //   if (wd.second != 0) {
+      //     post_send_data(wd.first, wd.second, _conn_context->id);
+      //   }
+      // }
+      post_send_data(pending_wds, _conn_context->id);
 
       // while(posted_rdma_write != num_completed_write) {
       //   // ibv_poll_cq(s_ctx->send_cq, )
       //   ;
       // }
-      // end = std::chrono::high_resolution_clock::now();
+      end = std::chrono::high_resolution_clock::now();
 
-      // post_send_write_len();
+      post_send_write_len();
 
 
       has_sent = false;
-      // local_sbf->flush();
+      local_sbf->flush();
       write_accumulated = 0;
       write_accumulated_msg = 0;
       while(posted_rdma_write != num_completed_write) {
@@ -1252,10 +1248,7 @@ namespace emp
       while (!conn->connected)
         ;
 
-      // while (posted_send_wr - completed_send_wr >= TX_BUFFER_DEP)
-        // ;
       TEST_NZ(ibv_post_send(conn->qp, &wr, &bad_wr));
-      // posted_send_wr += 1;
 
     }
 
@@ -1267,8 +1260,8 @@ namespace emp
       qp_attr->recv_cq = s_ctx->recv_cq;
       qp_attr->qp_type = IBV_QPT_RC;
 
-      qp_attr->cap.max_send_wr = 8000;
-      qp_attr->cap.max_recv_wr = 100;
+      qp_attr->cap.max_send_wr = TX_BUFFER_DEP;
+      qp_attr->cap.max_recv_wr = TX_BUFFER_DEP;
       qp_attr->cap.max_send_sge = 1;
       qp_attr->cap.max_recv_sge = 1;
     }
