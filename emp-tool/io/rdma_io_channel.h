@@ -1004,9 +1004,9 @@ namespace emp
       local_sbf->flush();
       write_accumulated = 0;
       write_accumulated_msg = 0;
-      while(posted_rdma_write != num_completed_write) {
-        ;
-      }
+      // while(posted_rdma_write != num_completed_write) {
+      //   ;
+      // }
     }
 
     void sync()
