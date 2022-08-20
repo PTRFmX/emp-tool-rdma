@@ -53,12 +53,14 @@ void die(const char *reason)
 }
 
 const int TIMEOUT_IN_MS = 500; /* ms */
-#define RDMA_BUFFER_SIZE (1UL << 30)
+#define RDMA_BUFFER_SIZE (1UL << 26)
 #define UPDATE_READ_FACTOR 10
-#define UPDATE_WRITE_FACTOR_SIZE (1UL << 15)
-#define UPDATE_WRITE_FACTOR_MSG 128
+#define UPDATE_WRITE_FACTOR_SIZE (1UL << 8)
+#define UPDATE_WRITE_FACTOR_MSG 8
 
-#define TX_BUFFER_DEP 8192
+#define MAX_INLINE_DATA 128
+
+#define TX_BUFFER_DEP 4096
 
 namespace emp
 {
@@ -124,16 +126,9 @@ namespace emp
 
       if (ppos + len > buffer_len)
       {
-        // printf("deal with a wrap\n");
-        // printf("%lu, %lu \n", pending_writes[0].first, pending_writes[0].second);
-        // printf("%lu \n", ppos);
-        // printf("%lu \n", ppos - pending_writes[0].first);
         uint64_t first_block_size = buffer_len - ppos;
         uint64_t second_block_size = len - first_block_size;
-        // printf("block size: %lu, %lu\n", first_block_size, second_block_size);
         memcpy((char *)buffer + ppos, data, first_block_size);
-        // res.push_back(std::make_pair(ppos, first_block_size));
-        // pending_writes[0].second += first_block_size;
         add_pending_write(first_block_size);
         memcpy((char *)buffer, data + first_block_size, second_block_size);
         // res.push_back(std::make_pair(0, second_block_size));
@@ -267,6 +262,7 @@ namespace emp
 
     struct rdma_cm_id *id;
     struct ibv_qp *qp;
+    struct ibv_qp *qp_ud;
 
     int connected;
 
@@ -660,7 +656,7 @@ namespace emp
       wr.opcode = IBV_WR_RDMA_WRITE;
       wr.sg_list = &sge;
       wr.num_sge = 1;
-      wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_FENCE;
+      wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
       wr.wr.rdma.remote_addr = (uintptr_t)&(remote_sbf->write_size_total);
       wr.wr.rdma.rkey = conn->peer_mr.rkey;
 
@@ -668,9 +664,9 @@ namespace emp
       sge.length = sizeof(local_sbf->write_size_total);
       sge.lkey = conn->rdma_local_mr->lkey;
       // printf("make sure all writes finished: %d, %d\n", posted_rdma_write, num_completed_write);
-      // while(posted_rdma_write != num_completed_write) {
-      //   ;
-      // }
+      while(posted_rdma_write != num_completed_write) {
+        ;
+      }
       // printf("wait finished\n");
 
       posted_rdma_write += 1;
@@ -701,7 +697,7 @@ namespace emp
       wr.opcode = IBV_WR_RDMA_WRITE;
       wr.sg_list = &sge;
       wr.num_sge = 1;
-      wr.send_flags = IBV_SEND_SIGNALED;
+      wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
       wr.wr.rdma.remote_addr = (uintptr_t)&(remote_sbf->remote_read_size_total);
       wr.wr.rdma.rkey = conn->peer_mr.rkey;
 
@@ -983,18 +979,8 @@ namespace emp
 
       StreamBuffer *local_sbf = (StreamBuffer *)(_conn_context->rdma_local_buffer);
       auto pending_wds = local_sbf->get_pending_writes();
-
-      // for (auto &wd : pending_wds) {
-      //   if (wd.second != 0) {
-      //     post_send_data(wd.first, wd.second, _conn_context->id);
-      //   }
-      // }
       post_send_data(pending_wds, _conn_context->id);
 
-      // while(posted_rdma_write != num_completed_write) {
-      //   // ibv_poll_cq(s_ctx->send_cq, )
-      //   ;
-      // }
       end = std::chrono::high_resolution_clock::now();
 
       post_send_write_len();
@@ -1261,9 +1247,10 @@ namespace emp
       qp_attr->qp_type = IBV_QPT_RC;
 
       qp_attr->cap.max_send_wr = TX_BUFFER_DEP;
-      qp_attr->cap.max_recv_wr = TX_BUFFER_DEP;
+      qp_attr->cap.max_recv_wr = 128;
       qp_attr->cap.max_send_sge = 1;
       qp_attr->cap.max_recv_sge = 1;
+      qp_attr->cap.max_inline_data = MAX_INLINE_DATA;
     }
 
     int on_connect_request(struct rdma_cm_id *id)
