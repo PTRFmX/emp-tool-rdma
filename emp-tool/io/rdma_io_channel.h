@@ -564,6 +564,7 @@ namespace emp
 
     void send_data_internal(const void *data, size_t len, bool flush = false)
     {
+      // printf("send: %d\n", len);
       StreamBuffer *buf = (StreamBuffer *)_conn_context->rdma_local_buffer;
       WriteDescriptor new_wd;
       
@@ -749,7 +750,10 @@ namespace emp
       
       remote_sbf->read(data, len);
       read_accumulated += len;
-      post_send_read_len();
+      if (read_accumulated >= BATCH_THREASHOLD) {
+        post_send_read_len();
+        read_accumulated = 0;
+      }
 
     }
 
